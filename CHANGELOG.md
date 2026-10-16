@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- `auto_compound_vault::harvest` no longer trusts a caller-supplied
+  `yield_amount`, which let anyone with a dust deposit pay themselves the
+  vault's entire balance as a "harvest fee" and inflate `TotalManagedAssets`
+  with unbacked yield. Yield is now measured as the vault's token balance
+  above `TotalManagedAssets`, and only the admin or keepers registered with
+  the new `set_keeper` can harvest. `deposit` credits the balance actually
+  received, so `TotalManagedAssets` is always backed by tokens the vault
+  holds. **Breaking:** `harvest(caller, yield_amount)` is now
+  `harvest(caller)` (#334).
 - Funding, pool-deposit and repayment APIs verify the submitted Stellar
   transaction against Horizon (success, signer, loan-bound memo, amount and
   destination) before crediting anything; previously any hash was accepted.
