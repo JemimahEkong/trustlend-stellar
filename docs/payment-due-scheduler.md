@@ -60,8 +60,13 @@ curl -X POST https://your-app.vercel.app/api/cron/payment-due \
   -H "Authorization: Bearer $CRON_SECRET"
 ```
 
-**Local development:** the `Authorization` check is skipped when `CRON_SECRET`
-is not configured.
+**Fail-closed auth:** the check lives in [`lib/auth/cron.ts`](../lib/auth/cron.ts)
+and is shared by every `/api/cron/*` route. A missing or wrong token gets `401`.
+If `CRON_SECRET` is not configured the route refuses all calls with `500`
+(server misconfigured) rather than running unauthenticated.
+
+**Local development:** only when `NODE_ENV=development` (i.e. `npm run dev`) is
+the `Authorization` check skipped for an unset `CRON_SECRET`.
 
 ## Failure handling
 

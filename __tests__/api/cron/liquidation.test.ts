@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { NextRequest } from "next/server";
@@ -52,6 +52,11 @@ describe("POST /api/cron/liquidation", () => {
     mockGetAdminKeypair.mockReturnValue({} as never);
   });
 
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
   it("runs the keeper and returns the summary (success path)", async () => {
     process.env.CRON_SECRET = "s3cret";
     mockRunLiquidationKeeper.mockResolvedValue(SUMMARY);
@@ -85,8 +90,20 @@ describe("POST /api/cron/liquidation", () => {
     expect(mockRunLiquidationKeeper).not.toHaveBeenCalled();
   });
 
-  it("runs without auth when CRON_SECRET is unset (dev mode)", async () => {
+  it("fails closed when CRON_SECRET is unset outside development (500)", async () => {
     delete process.env.CRON_SECRET;
+    vi.stubEnv("NODE_ENV", "production");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const response = await POST(new NextRequest("http://localhost/api/cron/liquidation"));
+
+    expect(response.status).toBe(500);
+    expect(mockRunLiquidationKeeper).not.toHaveBeenCalled();
+  });
+
+  it("runs without auth when CRON_SECRET is unset in development", async () => {
+    delete process.env.CRON_SECRET;
+    vi.stubEnv("NODE_ENV", "development");
     mockRunLiquidationKeeper.mockResolvedValue(SUMMARY);
 
     const response = await POST(new NextRequest("http://localhost/api/cron/liquidation"));
