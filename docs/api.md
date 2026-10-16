@@ -82,6 +82,62 @@ fetch("https://trustlend.xyz/api/pools?status=active&limit=5", {
 
 ---
 
+## 1a. Pool Utilization History
+
+Daily pool capacity, borrowed volume and utilization rate over a recent window. Powers the "Pool Utilization" chart on the lender dashboard.
+
+### Endpoint
+`GET /api/pools/performance`
+
+### Query Parameters
+
+| Parameter | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `range` | `string` | No | `7d`, `30d` or `90d` (default: `30d`). |
+| `poolId` | `uuid` | No | Limit to one pool. Omit for the aggregate across all pools. |
+
+### Response Payload (200 OK)
+```json
+{
+  "success": true,
+  "range": "30d",
+  "days": 30,
+  "poolId": null,
+  "generatedAt": "2026-10-17T12:00:00.000Z",
+  "points": [
+    {
+      "date": "2026-10-17",
+      "totalLiquidity": 1000,
+      "borrowed": 350,
+      "available": 650,
+      "utilizationRate": 35,
+      "newBorrowed": 0,
+      "deposits": 0,
+      "withdrawals": 100
+    }
+  ],
+  "summary": {
+    "currentUtilization": 35,
+    "averageUtilization": 45,
+    "peakUtilization": 50,
+    "currentLiquidity": 1000,
+    "currentBorrowed": 350,
+    "borrowedVolume": 550,
+    "netFlow": 300
+  }
+}
+```
+
+- One point per UTC day, oldest first. Each point is the state at the end of that day, and the last point is "now".
+- `utilizationRate = (borrowed / totalLiquidity) × 100`, clamped to 0–100 and rounded to two decimals.
+- Amounts are in XLM. `totalLiquidity` is rebuilt from the current pool totals and the confirmed deposit / withdrawal ledger. `borrowed` is the principal of pool-funded loans still outstanding at the end of each day.
+
+### Error Responses
+- `400`: unknown `range` or malformed `poolId`.
+- `503`: database not configured.
+
+---
+
 ## 2. Check Borrower Reputation
 
 Check the trust score, credit tier, borrowing limits, and historical credit events for any borrower registered on the platform by their Stellar public key.

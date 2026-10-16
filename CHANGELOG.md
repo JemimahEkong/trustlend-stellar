@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   position was reduced without any XLM moving.
 
 ### Added
+- Lender dashboard "Pool Utilization" chart: a responsive 30-day area chart
+  of `(borrowed / totalLiquidity) × 100` with a hover / touch / keyboard
+  tooltip (utilization %, borrowed XLM, pool capacity), backed by the new
+  `GET /api/pools/performance?range=7d|30d|90d[&poolId=]` endpoint (#333).
 - End-to-end on-chain loan lifecycle: mandatory, verified
   `create_loan_request`; lender-signed `approve_loan`; server-signed
   `activate_loan`, `record_payment` and pooled-lending state sync;
