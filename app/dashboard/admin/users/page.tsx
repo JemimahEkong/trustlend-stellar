@@ -1,30 +1,74 @@
 import { WorkspaceFrame } from "@/components/dashboard/WorkspaceFrame";
 import { WalletCard } from "@/components/dashboard/WalletCard";
+import { AdminUsersTable } from "@/components/dashboard/AdminUsersTable";
 import { adminNavLinks } from "@/lib/dashboard/admin-links";
 import { requireTradeVaultAdmin } from "@/lib/auth/session";
 import {
   getAdminDashboardMetrics,
   presentAdminMetrics,
 } from "@/lib/dashboard/metrics";
-import { desc } from "drizzle-orm";
+import {
+  USERS_PAGE_SIZE,
+  countByRole,
+  paginate,
+  parsePageParam,
+} from "@/lib/dashboard/admin-users";
+import { desc, inArray, sql } from "drizzle-orm";
 import { getDb } from "@/lib/db/client";
 import { profileToRow } from "@/lib/db/rows";
 import { profiles } from "@/lib/db/schema";
+import Link from "next/link";
 
-export default async function AdminUsersPage() {
+type SearchParams = Promise<Record<string, string | string[] | undefined>>;
+
+const countOf = sql<number>`count(*)::int`;
+
+export default async function AdminUsersPage({
+  searchParams,
+}: {
+  searchParams?: SearchParams;
+}) {
   const { user } = await requireTradeVaultAdmin();
   const metrics = await getAdminDashboardMetrics();
   const walletAddress = String(user.walletAddress ?? "") || null;
   const walletConnected = Boolean(walletAddress);
 
+  const requestedPage = parsePageParam(((await searchParams) ?? {}).page);
+
   const db = getDb();
-  const allUsers = db
-    ? (await db.select().from(profiles).orderBy(desc(profiles.createdAt)).limit(80)).map(profileToRow)
+
+  // Segment counts are platform-wide aggregates, independent of the page shown.
+  const [roleRows, [flaggedRes], [pendingKycRes]] = db
+    ? await Promise.all([
+        db.select({ role: profiles.role, count: countOf }).from(profiles).groupBy(profiles.role),
+        db.select({ count: countOf }).from(profiles).where(inArray(profiles.riskStatus, ["high", "blocked"])),
+        db
+          .select({ count: countOf })
+          .from(profiles)
+          .where(inArray(profiles.kycStatus, ["pending", "submitted", "rejected"])),
+      ])
+    : [[], [], []];
+
+  const roleCounts = countByRole(roleRows);
+  const totalUsers = roleRows.reduce((sum, row) => sum + Number(row.count ?? 0), 0);
+  const flagged = Number(flaggedRes?.count ?? 0);
+  const pendingKyc = Number(pendingKycRes?.count ?? 0);
+
+  const pagination = paginate(totalUsers, requestedPage, USERS_PAGE_SIZE);
+  const pageUsers = db && totalUsers > 0
+    ? (
+        await db
+          .select()
+          .from(profiles)
+          // id tiebreak keeps pages stable when several users share a timestamp.
+          .orderBy(desc(profiles.createdAt), desc(profiles.id))
+          .limit(USERS_PAGE_SIZE)
+          .offset(pagination.offset)
+      ).map(profileToRow)
     : [];
-  const borrowers = allUsers.filter((profile) => String(profile.role) === "borrower").length;
-  const lenders = allUsers.filter((profile) => String(profile.role) === "lender").length;
-  const flagged = allUsers.filter((profile) => ["high", "blocked"].includes(String(profile.risk_status))).length;
-  const pendingKyc = allUsers.filter((profile) => ["pending", "submitted", "rejected"].includes(String(profile.kyc_status))).length;
+
+  const pageHref = (page: number) =>
+    page <= 1 ? "/dashboard/admin/users" : `/dashboard/admin/users?page=${page}`;
 
   return (
     <WorkspaceFrame
@@ -41,8 +85,8 @@ export default async function AdminUsersPage() {
         <WalletCard
           address={walletAddress}
           available={0}
-          inLoansOrPools={Number(allUsers.length)}
-          pending={Number(flagged)}
+          inLoansOrPools={totalUsers}
+          pending={flagged}
           inLoansLabel="Users"
           compact
           inLoansIsCurrency={false}
@@ -62,51 +106,50 @@ export default async function AdminUsersPage() {
               <article className="workspace-card workspace-card--full">
                 <h2 className="workspace-card-title">User segments</h2>
                 <ul className="workspace-list workspace-list--compact">
-                  <li><span>Total accounts</span><strong>{allUsers.length}</strong></li>
-                  <li><span>Borrowers</span><strong>{borrowers}</strong></li>
-                  <li><span>Lenders</span><strong>{lenders}</strong></li>
+                  <li><span>Total accounts</span><strong>{totalUsers}</strong></li>
+                  <li><span>Borrowers</span><strong>{roleCounts.borrower}</strong></li>
+                  <li><span>Lenders</span><strong>{roleCounts.lender}</strong></li>
                   <li><span>Flagged risk profiles</span><strong>{flagged}</strong></li>
                   <li><span>Pending KYC profiles</span><strong>{pendingKyc}</strong></li>
                 </ul>
               </article>
             </section>
 
-            <div className="workspace-table-wrap">
-                  <table className="workspace-table">
-                    <thead>
-                      <tr>
-                        <th>User ID</th>
-                        <th>Role</th>
-                        <th>Name</th>
-                        <th>KYC</th>
-                        <th>Risk</th>
-                        <th>Joined</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {allUsers.length === 0 ? (
-                        <tr><td colSpan={6} style={{ textAlign: "center", padding: "1.5rem", opacity: 0.5 }}>No users found.</td></tr>
-                      ) : allUsers.map((p) => (
-                        <tr key={String(p.id)}>
-                          <td style={{ fontFamily: "monospace", fontSize: "0.8rem" }}>{String(p.id).slice(0,8)}</td>
-                          <td><span style={{ textTransform: "capitalize", fontWeight: 600 }}>{String(p.role)}</span></td>
-                          <td>{String(p.full_name || "Unknown")}</td>
-                          <td>
-                            <span style={{ padding: "0.15rem 0.5rem", borderRadius: "999px", fontSize: "0.75rem", fontWeight: 600, background: p.kyc_status === "verified" ? "color-mix(in srgb, var(--accent) 12%, transparent)" : "color-mix(in srgb, var(--warning) 12%, transparent)", color: p.kyc_status === "verified" ? "var(--accent)" : "var(--warning)" }}>
-                              {String(p.kyc_status).toUpperCase()}
-                            </span>
-                          </td>
-                          <td>
-                            <span style={{ padding: "0.15rem 0.5rem", borderRadius: "999px", fontSize: "0.75rem", fontWeight: 600, color: p.risk_status === "low" ? "var(--accent)" : p.risk_status === "blocked" ? "var(--danger)" : "var(--warning)", background: p.risk_status === "low" ? "color-mix(in srgb, var(--accent) 12%, transparent)" : p.risk_status === "blocked" ? "color-mix(in srgb, var(--danger) 12%, transparent)" : "color-mix(in srgb, var(--warning) 12%, transparent)" }}>
-                              {String(p.risk_status).toUpperCase()}
-                            </span>
-                          </td>
-                          <td>{p.created_at ? new Date(String(p.created_at)).toLocaleDateString() : "-"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-            </div>
+            <AdminUsersTable users={pageUsers} />
+
+            {totalUsers > 0 ? (
+              <nav
+                aria-label="User list pagination"
+                style={{ display: "flex", flexWrap: "wrap", gap: "0.75rem", justifyContent: "space-between", alignItems: "center" }}
+              >
+                <p className="workspace-card-copy" style={{ margin: 0 }}>
+                  Showing {pagination.from}–{pagination.to} of {totalUsers} users
+                  {pagination.totalPages > 1 ? ` · Page ${pagination.page} of ${pagination.totalPages}` : null}
+                </p>
+                {pagination.totalPages > 1 ? (
+                  <div style={{ display: "flex", gap: "0.5rem" }}>
+                    {pagination.hasPrev ? (
+                      <Link href={pageHref(pagination.page - 1)} className="workspace-nav-link" rel="prev">
+                        ← Previous
+                      </Link>
+                    ) : (
+                      <span className="workspace-nav-link" aria-disabled="true" style={{ opacity: 0.45, pointerEvents: "none" }}>
+                        ← Previous
+                      </span>
+                    )}
+                    {pagination.hasNext ? (
+                      <Link href={pageHref(pagination.page + 1)} className="workspace-nav-link" rel="next">
+                        Next →
+                      </Link>
+                    ) : (
+                      <span className="workspace-nav-link" aria-disabled="true" style={{ opacity: 0.45, pointerEvents: "none" }}>
+                        Next →
+                      </span>
+                    )}
+                  </div>
+                ) : null}
+              </nav>
+            ) : null}
           </>
         )}
       </div>

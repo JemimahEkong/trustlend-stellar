@@ -69,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dead code, the indexer stack, stale documentation and unused assets (#311).
 
 ### Fixed
+- Admin overview "Recent Users" rendered only the first user
+  (`profiles.slice(0, 1)`); it now lists all fetched users with a
+  "View all users" link, and its user / borrower / lender counts come from
+  platform-wide aggregates instead of the 10 fetched rows. The admin users
+  page is paginated (`?page=`), and KYC / risk badges use distinct tones
+  (`rejected` and `high` were shown as warnings) (#332).
 - `create_loan_request` and `set_pool_config` were called with plain JS
   objects instead of Soroban structs (and without `reputation_tier`), so the
   browser-side contract calls could never succeed.

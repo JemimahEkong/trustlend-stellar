@@ -1,12 +1,13 @@
 import { WorkspaceFrame } from "@/components/dashboard/WorkspaceFrame";
 import { WalletCard } from "@/components/dashboard/WalletCard";
+import { AdminUsersTable } from "@/components/dashboard/AdminUsersTable";
 import { adminNavLinks } from "@/lib/dashboard/admin-links";
 import { requireTradeVaultAdmin } from "@/lib/auth/session";
 import {
   getAdminDashboardMetrics,
   presentAdminMetrics,
 } from "@/lib/dashboard/metrics";
-import { desc } from "drizzle-orm";
+import { desc, sql } from "drizzle-orm";
 import { getDb } from "@/lib/db/client";
 import { ledgerToRow, loanToRow, poolToRow, profileToRow, repaymentToRow } from "@/lib/db/rows";
 import {
@@ -18,6 +19,7 @@ import {
   profiles as profilesTable,
 } from "@/lib/db/schema";
 import Link from "next/link";
+import { RECENT_USERS_LIMIT, countByRole } from "@/lib/dashboard/admin-users";
 import { formatCurrency } from "@/lib/utils/formatting";
 
 function sumByPeriod(
@@ -38,9 +40,9 @@ export default async function AdminDashboardPage() {
   // Platform-wide aggregates for the admin overview
   const db = getDb();
 
-  const [profileRows, loanRows, repaymentRows, ledgerRowsRaw, fraudRows, poolRows] = db
+  const [profileRows, loanRows, repaymentRows, ledgerRowsRaw, fraudRows, poolRows, roleCountRows] = db
     ? await Promise.all([
-        db.select().from(profilesTable).orderBy(desc(profilesTable.createdAt)).limit(10),
+        db.select().from(profilesTable).orderBy(desc(profilesTable.createdAt)).limit(RECENT_USERS_LIMIT),
         db.select().from(loansTable).orderBy(desc(loansTable.requestedAt)).limit(10),
         db.select().from(loanRepayments).orderBy(desc(loanRepayments.paidAt)).limit(120),
         db.select().from(ledgerTransactions).orderBy(desc(ledgerTransactions.createdAt)).limit(400),
@@ -57,8 +59,13 @@ export default async function AdminDashboardPage() {
           .orderBy(desc(fraudSignalsTable.createdAt))
           .limit(120),
         db.select().from(lendingPools).orderBy(desc(lendingPools.createdAt)).limit(10),
+        // Platform-wide role split; the profile rows above are only the latest few.
+        db
+          .select({ role: profilesTable.role, count: sql<number>`count(*)::int` })
+          .from(profilesTable)
+          .groupBy(profilesTable.role),
       ])
-    : [[], [], [], [], [], []];
+    : [[], [], [], [], [], [], []];
 
   const profiles = profileRows.map(profileToRow);
   const loans = loanRows.map(loanToRow);
@@ -96,8 +103,11 @@ export default async function AdminDashboardPage() {
   const sanctionedAmount = sanctionedLoans.reduce((sum, loan) => sum + Number(loan.principal_amount ?? 0), 0);
   const repaidAmount = repayments.reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
 
-  const lendersCount = profiles.filter((profile) => String(profile.role) === "lender").length;
-  const borrowersCount = profiles.filter((profile) => String(profile.role) === "borrower").length;
+  const roleCounts = countByRole(roleCountRows);
+  const lendersCount = roleCounts.lender;
+  const borrowersCount = roleCounts.borrower;
+  // metrics.totalUsers is a platform-wide count(*); never report fewer than we just rendered.
+  const totalUsers = Math.max(metrics.totalUsers, profiles.length);
   const activeUsers = new Set(
     ledgerRows
       .filter((row) => new Date(String(row.created_at)).getTime() >= activeWindowStart)
@@ -162,7 +172,7 @@ export default async function AdminDashboardPage() {
               <article className="workspace-card">
                 <h2 className="workspace-card-title">Users & access</h2>
                 <p className="workspace-card-copy">Active now: {activeUsers}</p>
-                <p className="workspace-card-copy">Total users: {profiles.length}</p>
+                <p className="workspace-card-copy">Total users: {totalUsers}</p>
                 <p className="workspace-card-copy">Borrowers: {borrowersCount}</p>
                 <p className="workspace-card-copy">Lenders: {lendersCount}</p>
               </article>
@@ -185,48 +195,20 @@ export default async function AdminDashboardPage() {
 
             <section className="workspace-grid workspace-grid--full">
               <article className="workspace-card workspace-card--full">
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
-                  <h2 className="workspace-card-title" style={{ margin: 0 }}>Recent Users</h2>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
+                  <div>
+                    <h2 className="workspace-card-title" style={{ margin: 0 }}>Recent Users</h2>
+                    {profiles.length > 0 ? (
+                      <p className="workspace-card-copy" style={{ margin: 0, fontSize: "0.8rem" }}>
+                        Showing the {profiles.length} most recent of {totalUsers} users
+                      </p>
+                    ) : null}
+                  </div>
                   <Link href="/dashboard/admin/users" className="workspace-nav-link" style={{ fontSize: "0.83rem" }}>
-                    See more →
+                    View all users →
                   </Link>
                 </div>
-                <div className="workspace-table-wrap">
-                  <table className="workspace-table">
-                    <thead>
-                      <tr>
-                        <th>User ID</th>
-                        <th>Role</th>
-                        <th>Name</th>
-                        <th>KYC</th>
-                        <th>Risk</th>
-                        <th>Joined</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {profiles.length === 0 ? (
-                        <tr><td colSpan={6} style={{ textAlign: "center", padding: "1.5rem", opacity: 0.5 }}>No users found.</td></tr>
-                      ) : profiles.slice(0, 1).map((p) => (
-                        <tr key={String(p.id)}>
-                          <td style={{ fontFamily: "monospace", fontSize: "0.8rem" }}>{String(p.id).slice(0,8)}</td>
-                          <td><span style={{ textTransform: "capitalize", fontWeight: 600 }}>{String(p.role)}</span></td>
-                          <td>{String(p.full_name || "Unknown")}</td>
-                          <td>
-                            <span style={{ padding: "0.15rem 0.5rem", borderRadius: "999px", fontSize: "0.75rem", fontWeight: 600, background: p.kyc_status === "verified" ? "color-mix(in srgb, var(--accent) 12%, transparent)" : "color-mix(in srgb, var(--warning) 12%, transparent)", color: p.kyc_status === "verified" ? "var(--accent)" : "var(--warning)" }}>
-                              {String(p.kyc_status).toUpperCase()}
-                            </span>
-                          </td>
-                          <td>
-                            <span style={{ padding: "0.15rem 0.5rem", borderRadius: "999px", fontSize: "0.75rem", fontWeight: 600, color: p.risk_status === "low" ? "var(--accent)" : p.risk_status === "blocked" ? "var(--danger)" : "var(--warning)", background: p.risk_status === "low" ? "color-mix(in srgb, var(--accent) 12%, transparent)" : p.risk_status === "blocked" ? "color-mix(in srgb, var(--danger) 12%, transparent)" : "color-mix(in srgb, var(--warning) 12%, transparent)" }}>
-                              {String(p.risk_status).toUpperCase()}
-                            </span>
-                          </td>
-                          <td>{p.created_at ? new Date(String(p.created_at)).toLocaleDateString() : "-"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                <AdminUsersTable users={profiles} />
               </article>
             </section>
 
