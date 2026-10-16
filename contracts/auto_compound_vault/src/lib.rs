@@ -21,9 +21,17 @@ pub enum DataKey {
     TotalShares,
     TotalManagedAssets,
     UserShares(Address),
+    /// Addresses (besides the admin) allowed to call `harvest`.
+    Keeper(Address),
 }
 
 // ─── AutoCompoundVaultContract ───────────────────────────────────────────────
+//
+// Solvency invariant: `TotalManagedAssets` never exceeds the vault's actual
+// balance of the asset token. Every increase is backed by tokens that are
+// measured arriving at the vault (`deposit` credits the observed balance delta,
+// `harvest` only recognises `balance - TotalManagedAssets`), and no caller can
+// supply an amount the vault takes on trust.
 
 #[contract]
 pub struct AutoCompoundVaultContract;
@@ -62,19 +70,24 @@ impl AutoCompoundVaultContract {
         }
 
         let asset_token = Self::get_asset_token(env.clone());
-        token::Client::new(&env, &asset_token).transfer(
-            &from,
-            &env.current_contract_address(),
-            &amount,
-        );
+        let token_client = token::Client::new(&env, &asset_token);
+        let vault = env.current_contract_address();
+
+        // Credit what actually arrived, not what the caller claims to send.
+        let balance_before = token_client.balance(&vault);
+        token_client.transfer(&from, &vault, &amount);
+        let received = token_client.balance(&vault) - balance_before;
+        if received <= 0 {
+            panic!("Deposit transferred no assets");
+        }
 
         let total_shares = Self::get_total_shares(env.clone());
         let total_managed = Self::get_total_managed_assets(env.clone());
 
         let shares = if total_shares == 0 || total_managed == 0 {
-            amount
+            received
         } else {
-            (amount * total_shares) / total_managed
+            (received * total_shares) / total_managed
         };
 
         if shares <= 0 {
@@ -86,11 +99,11 @@ impl AutoCompoundVaultContract {
 
         env.storage().persistent().set(&DataKey::UserShares(from.clone()), &new_user_shares);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares + shares));
-        env.storage().instance().set(&DataKey::TotalManagedAssets, &(total_managed + amount));
+        env.storage().instance().set(&DataKey::TotalManagedAssets, &(total_managed + received));
 
         env.events().publish(
             (symbol_short!("vault"), symbol_short!("deposit")),
-            (from, amount, shares),
+            (from, received, shares),
         );
 
         shares
@@ -142,36 +155,52 @@ impl AutoCompoundVaultContract {
         amount
     }
 
-    /// Publicly callable harvest function.
-    /// Claims interest, rewards caller with `harvest_fee_bps` fee, and reinvests
-    /// net yield into total managed assets (auto-compounding share value).
-    pub fn harvest(env: Env, caller: Address, yield_amount: i128) -> i128 {
+    /// Compound yield that has actually arrived in the vault.
+    ///
+    /// Restricted to the admin and admin-registered keepers (`set_keeper`).
+    /// The yield is not supplied by the caller: it is measured as the vault's
+    /// asset balance in excess of `TotalManagedAssets` (repaid interest,
+    /// rewards or any other tokens sent to the vault). The caller receives
+    /// `harvest_fee_bps` of that real yield as a keeper reward and the rest is
+    /// added to `TotalManagedAssets`, raising the share exchange rate.
+    ///
+    /// Afterwards `TotalManagedAssets` equals the vault's token balance, so
+    /// the same yield cannot be harvested twice and the fee can never exceed
+    /// tokens the vault really holds beyond depositors' principal.
+    pub fn harvest(env: Env, caller: Address) -> i128 {
         caller.require_auth();
-
-        if yield_amount <= 0 {
-            panic!("Yield amount must be positive");
-        }
+        Self::require_harvester(&env, &caller);
 
         let total_shares = Self::get_total_shares(env.clone());
         if total_shares == 0 {
             panic!("No active deposits in vault");
         }
 
+        let asset_token = Self::get_asset_token(env.clone());
+        let token_client = token::Client::new(&env, &asset_token);
+        let vault = env.current_contract_address();
+
+        let current_managed = Self::get_total_managed_assets(env.clone());
+        let yield_amount = token_client.balance(&vault) - current_managed;
+        if yield_amount <= 0 {
+            panic!("No harvestable yield");
+        }
+
         let harvest_fee_bps = Self::get_harvest_fee_bps(env.clone());
         let fee = (yield_amount * (harvest_fee_bps as i128)) / 10_000;
         let reinvest = yield_amount - fee;
+        let new_managed = current_managed + reinvest;
+
+        // Effects before the external token call.
+        env.storage().instance().set(&DataKey::TotalManagedAssets, &new_managed);
 
         if fee > 0 {
-            let asset_token = Self::get_asset_token(env.clone());
-            token::Client::new(&env, &asset_token).transfer(
-                &env.current_contract_address(),
-                &caller,
-                &fee,
-            );
+            token_client.transfer(&vault, &caller, &fee);
         }
 
-        let current_managed = Self::get_total_managed_assets(env.clone());
-        env.storage().instance().set(&DataKey::TotalManagedAssets, &(current_managed + reinvest));
+        if new_managed > token_client.balance(&vault) {
+            panic!("Managed assets exceed vault reserves");
+        }
 
         env.events().publish(
             (symbol_short!("vault"), symbol_short!("harvest")),
@@ -179,6 +208,38 @@ impl AutoCompoundVaultContract {
         );
 
         reinvest
+    }
+
+    /// Yield currently sitting in the vault that `harvest` would recognise.
+    pub fn get_pending_yield(env: Env) -> i128 {
+        let asset_token = Self::get_asset_token(env.clone());
+        let balance = token::Client::new(&env, &asset_token).balance(&env.current_contract_address());
+        (balance - Self::get_total_managed_assets(env)).max(0)
+    }
+
+    /// Admin-only: grant or revoke permission to call `harvest`.
+    pub fn set_keeper(env: Env, caller: Address, keeper: Address, enabled: bool) {
+        caller.require_auth();
+        let admin = Self::get_admin(env.clone());
+        if caller != admin {
+            panic!("Unauthorised caller");
+        }
+
+        let key = DataKey::Keeper(keeper.clone());
+        if enabled {
+            env.storage().persistent().set(&key, &true);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+
+        env.events().publish(
+            (symbol_short!("vault"), symbol_short!("keeper")),
+            (keeper, enabled),
+        );
+    }
+
+    pub fn is_keeper(env: Env, keeper: Address) -> bool {
+        env.storage().persistent().get(&DataKey::Keeper(keeper)).unwrap_or(false)
     }
 
     // ── Getters & Admin Config ───────────────────────────────────────────────
@@ -240,6 +301,12 @@ impl AutoCompoundVaultContract {
         }
         let total_managed = Self::get_total_managed_assets(env);
         (total_managed * PRECISION) / total_shares
+    }
+
+    fn require_harvester(env: &Env, caller: &Address) {
+        if *caller != Self::get_admin(env.clone()) && !Self::is_keeper(env.clone(), caller.clone()) {
+            panic!("Unauthorised harvester");
+        }
     }
 
     pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
