@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pool withdrawals are paid from the platform wallet by the server
   (`PLATFORM_WALLET_SECRET`) and refused when it cannot sign; previously the
   position was reduced without any XLM moving.
+- Cron endpoints (`/api/cron/*`) fail closed: when `CRON_SECRET` is unset they
+  reject every call with 500 instead of running unauthenticated. The
+  unauthenticated bypass is limited to `NODE_ENV=development`, and all routes
+  share one constant-time check in `lib/auth/cron.ts` (#331).
 
 ### Added
 - End-to-end on-chain loan lifecycle: mandatory, verified

@@ -41,7 +41,10 @@ Vercel Cron (02:00 UTC)  ──Bearer CRON_SECRET──►  /api/cron/default-ma
 
 - **Authenticated:** the route rejects any request whose `Authorization` header
   isn't `Bearer ${CRON_SECRET}` (same scheme as the existing `payment-due` cron).
-  In Vercel, set `CRON_SECRET` and Vercel Cron sends it automatically.
+  In Vercel, set `CRON_SECRET` and Vercel Cron sends it automatically. The check
+  fails closed (shared helper in [lib/auth/cron.ts](../lib/auth/cron.ts)): with
+  `CRON_SECRET` unset the route answers `500` and does nothing, except under
+  `NODE_ENV=development`.
 - **Signing key isolation:** contract calls are signed server-side with
   `ADMIN_SECRET_KEY`, read only inside [lib/stellar/server-contract.ts](../lib/stellar/server-contract.ts)
   (never `NEXT_PUBLIC_`, never sent to the browser).

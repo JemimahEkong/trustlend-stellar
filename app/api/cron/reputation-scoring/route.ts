@@ -1,22 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireCronAuth } from "@/lib/auth/cron";
 import { runDailyReputationRecalculation } from "@/lib/reputation/daily-sync";
 
-function isAuthorized(request: NextRequest): boolean {
-  const secret = process.env.CRON_SECRET;
-  if (!secret) {
-    // In local dev without CRON_SECRET, allow executions
-    return true;
-  }
-  const authHeader = request.headers.get("authorization");
-  if (!authHeader) return false;
-  return authHeader === `Bearer ${secret}`;
-}
-
 export async function POST(request: NextRequest) {
+  // Verify the caller is the trusted scheduler (fails closed, see lib/auth/cron.ts).
+  const denied = requireCronAuth(request, "reputation-scoring");
+  if (denied) return denied;
+
   try {
-    if (!isAuthorized(request)) {
-      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
-    }
 
     const summary = await runDailyReputationRecalculation();
 

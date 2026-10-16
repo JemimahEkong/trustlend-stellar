@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireCronAuth } from "@/lib/auth/cron";
 import {
   loadOracleConfig,
   runOracleCycle,
@@ -25,13 +26,9 @@ import { createDefaultSources } from "@/lib/oracle/sources";
  * straight through to the on-chain TWAP.
  */
 export async function POST(request: NextRequest) {
-  const secret = process.env.CRON_SECRET;
-  if (secret) {
-    const authHeader = request.headers.get("authorization");
-    if (authHeader !== `Bearer ${secret}`) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  // Verify the caller is the trusted scheduler (fails closed, see lib/auth/cron.ts).
+  const denied = requireCronAuth(request, "price-oracle");
+  if (denied) return denied;
 
   const start = Date.now();
   try {

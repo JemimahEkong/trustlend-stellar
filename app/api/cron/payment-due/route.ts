@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireCronAuth } from "@/lib/auth/cron";
 import { runPaymentDueScheduler } from "@/lib/scheduler/payment-due";
 
 /**
@@ -8,14 +9,9 @@ import { runPaymentDueScheduler } from "@/lib/scheduler/payment-due";
  * Secured via CRON_SECRET in the Authorization header.
  */
 export async function POST(request: NextRequest) {
-  // Verify the caller is the trusted scheduler
-  const secret = process.env.CRON_SECRET;
-  if (secret) {
-    const authHeader = request.headers.get("authorization");
-    if (authHeader !== `Bearer ${secret}`) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  // Verify the caller is the trusted scheduler (fails closed, see lib/auth/cron.ts).
+  const denied = requireCronAuth(request, "payment-due");
+  if (denied) return denied;
 
   const start = Date.now();
   try {

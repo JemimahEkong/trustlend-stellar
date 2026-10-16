@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireCronAuth } from "@/lib/auth/cron";
 import { getAdminKeypair } from "@/lib/stellar/server-contract";
 import { loadConfig, runLiquidationKeeper } from "@/scripts/liquidation-keeper";
 
@@ -18,14 +19,9 @@ import { loadConfig, runLiquidationKeeper } from "@/scripts/liquidation-keeper";
  * ADMIN_SECRET_KEY's address, so a leaked endpoint alone cannot move funds.
  */
 export async function POST(request: NextRequest) {
-  // Verify the caller is the trusted scheduler.
-  const secret = process.env.CRON_SECRET;
-  if (secret) {
-    const authHeader = request.headers.get("authorization");
-    if (authHeader !== `Bearer ${secret}`) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  // Verify the caller is the trusted scheduler (fails closed, see lib/auth/cron.ts).
+  const denied = requireCronAuth(request, "liquidation");
+  if (denied) return denied;
 
   const start = Date.now();
   try {
