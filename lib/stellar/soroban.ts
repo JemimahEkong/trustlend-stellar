@@ -9,6 +9,7 @@ import {
   Address,
   nativeToScVal,
   scValToNative,
+  StrKey,
 } from "@stellar/stellar-sdk";
 import { signTransactionWithWallet } from "@/lib/stellar/wallet";
 import { redis } from "@/lib/services/redis";
@@ -140,9 +141,18 @@ async function sorobanRpc<T = Record<string, unknown>>(
 /**
  * Fetch account sequence number from Horizon REST API.
  * Soroban RPC has no getAccount method — account data lives on Horizon.
+ *
+ * The address is validated as an Ed25519 public key (G...) before it is
+ * interpolated into the request URL, so a malformed or malicious value can
+ * never alter the request path.
  */
-async function getAccountSequence(address: string): Promise<string> {
-  const res = await fetch(`${HORIZON_URL}/accounts/${address}`);
+export async function getAccountSequence(address: string): Promise<string> {
+  if (typeof address !== "string" || !StrKey.isValidEd25519PublicKey(address)) {
+    throw new Error(
+      "Invalid Stellar account address: expected a 56-character Ed25519 public key starting with 'G'.",
+    );
+  }
+  const res = await fetch(`${HORIZON_URL}/accounts/${encodeURIComponent(address)}`);
   if (!res.ok) {
     if (res.status === 404) {
       throw new Error(
