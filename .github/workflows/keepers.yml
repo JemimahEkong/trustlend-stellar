@@ -19,6 +19,11 @@ concurrency:
   group: keepers
   cancel-in-progress: false
 
+# Only curls the cron endpoints with repository secrets; the GITHUB_TOKEN is
+# never used, so it gets the minimum read-only scope.
+permissions:
+  contents: read
+
 jobs:
   run:
     name: Trigger cron endpoints
