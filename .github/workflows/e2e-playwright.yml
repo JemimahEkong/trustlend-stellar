@@ -10,6 +10,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Read access for actions/checkout. The npm cache and artifact upload use the
+# Actions runtime token, which these scopes do not restrict.
+permissions:
+  contents: read
+
 jobs:
   playwright-tests:
     timeout-minutes: 60
