@@ -145,7 +145,7 @@ describe("AdminUsersTable", () => {
   it("shows the empty state when there are no users", () => {
     const html = render([]);
     expect(html).toContain("No users found.");
-    expect(html).toContain('colspan="6"');
+    expect(html.toLowerCase()).toContain('colspan="6"');
     expect(html).not.toContain('data-badge="kyc"');
   });
 });
