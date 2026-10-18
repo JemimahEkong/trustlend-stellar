@@ -1666,10 +1666,17 @@ fn setup_multi_collateral() -> (Env, Address, Address, Address, Address, Address
     client.initialize(&admin);
     client.set_multisig_admin(&admin, &admin);
 
-    let asset_a = Address::generate(&env);
-    let asset_b = Address::generate(&env);
+    let asset_a_admin = Address::generate(&env);
+    let asset_b_admin = Address::generate(&env);
+    let asset_a = env.register_stellar_asset_contract_v2(asset_a_admin).address();
+    let asset_b = env.register_stellar_asset_contract_v2(asset_b_admin).address();
     client.whitelist_asset(&admin, &asset_a);
     client.whitelist_asset(&admin, &asset_b);
+
+    // Give each test borrower ample funds so deposits exercise real transfers.
+    let funding = 1_000_000_000_000_000i128;
+    token::StellarAssetClient::new(&env, &asset_a).mint(&borrower, &funding);
+    token::StellarAssetClient::new(&env, &asset_b).mint(&borrower, &funding);
 
     link_reputation(&env, &client, &admin, &borrower);
 
@@ -1682,7 +1689,12 @@ fn test_deposit_collateral_single_asset() {
     let (env, contract_id, _admin, borrower, asset_a, _asset_b) = setup_multi_collateral();
     let client = LendingContractClient::new(&env, &contract_id);
 
+    let token_client = token::Client::new(&env, &asset_a);
+    let borrower_before = token_client.balance(&borrower);
+    let contract_before = token_client.balance(&contract_id);
     client.deposit_collateral(&borrower, &asset_a, &1_000_0000000);
+    assert_eq!(token_client.balance(&borrower), borrower_before - 1_000_0000000);
+    assert_eq!(token_client.balance(&contract_id), contract_before + 1_000_0000000);
 
     let entries = client.get_user_collateral_entries(&borrower);
     assert_eq!(entries.len(), 1);
@@ -1751,8 +1763,15 @@ fn test_withdraw_collateral_basic() {
     let (env, contract_id, _admin, borrower, asset_a, _asset_b) = setup_multi_collateral();
     let client = LendingContractClient::new(&env, &contract_id);
 
+    let token_client = token::Client::new(&env, &asset_a);
+    let borrower_before = token_client.balance(&borrower);
+    let contract_before = token_client.balance(&contract_id);
     client.deposit_collateral(&borrower, &asset_a, &5_000_0000000);
+    assert_eq!(token_client.balance(&borrower), borrower_before - 5_000_0000000);
+    assert_eq!(token_client.balance(&contract_id), contract_before + 5_000_0000000);
     client.withdraw_collateral(&borrower, &asset_a, &2_000_0000000);
+    assert_eq!(token_client.balance(&borrower), borrower_before - 3_000_0000000);
+    assert_eq!(token_client.balance(&contract_id), contract_before + 3_000_0000000);
 
     let entries = client.get_user_collateral_entries(&borrower);
     assert_eq!(entries.len(), 1);

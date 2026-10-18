@@ -1006,8 +1006,8 @@ impl LendingContract {
     /// `asset` must be whitelisted.
     /// `amount` must be positive.
     ///
-    /// This is a bookkeeping operation — the actual asset transfer is handled
-    /// via token transfer before this call.
+    /// Tokens are pulled from the borrower into contract custody before the
+    /// collateral position is updated.
     pub fn deposit_collateral(env: Env, borrower: Address, asset: Address, amount: i128) {
         borrower.require_auth();
         Self::assert_not_paused(&env);
@@ -1024,6 +1024,9 @@ impl LendingContract {
         {
             panic!("Asset is not whitelisted");
         }
+
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&borrower, &env.current_contract_address(), &amount);
 
         // Get or create user's collateral entries
         let key = DataKey::UserCollateral(borrower.clone());
@@ -1152,6 +1155,9 @@ impl LendingContract {
                 borrowing_power, total_active_debt,
             );
         }
+
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&env.current_contract_address(), &borrower, &amount);
 
         // Update storage
         if new_entries.is_empty() {
