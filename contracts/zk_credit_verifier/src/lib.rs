@@ -1,7 +1,13 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String,
+    contract, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env,
+    String,
 };
+
+/// Version of the `ZkProofStatement` layout providers sign. Bump it whenever
+/// the statement changes so old signatures can never verify against a new
+/// layout.
+pub const PROOF_STATEMENT_VERSION: u32 = 1;
 
 /// Reputation tier matching borrower_reputation contract enum indexing.
 /// 1 = Beginner, 2 = Silver, 3 = Gold, 4 = Platinum
@@ -20,8 +26,12 @@ pub enum ZkCreditTier {
 pub struct ZkProofPayload {
     /// Unique nullifier hash derived from secret off-chain data + borrower context (SHA-256 / Poseidon)
     pub nullifier: BytesN<32>,
-    /// Cryptographic proof signature or SNARK proof commitment bytes (64 bytes)
+    /// Ed25519 signature by the provider over `proof_digest(borrower, payload)`
+    /// (64 bytes). See `ZkProofStatement` for exactly what is signed.
     pub proof_bytes: BytesN<64>,
+    /// The provider's Ed25519 public key. Its SHA-256 must equal the
+    /// `public_key_hash` registered for `provider_id`.
+    pub provider_public_key: BytesN<32>,
     /// Minimum off-chain credit score threshold proven in zero-knowledge (e.g. 700, 750, 800)
     pub min_score_threshold: u32,
     /// Target tier requested based on proven score (1=Beginner, 2=Silver, 3=Gold, 4=Platinum)
@@ -42,6 +52,30 @@ pub struct ZkVerificationRecord {
     pub tier_granted: u32,
     pub nullifier: BytesN<32>,
     pub verified_at: u64,
+}
+
+/// The attestation a registered provider signs with its Ed25519 key.
+///
+/// It binds every field of the proof to the network, this verifier contract
+/// and the borrower, so a signature cannot be replayed on another network or
+/// deployment, transferred to another borrower, or reused after changing the
+/// tier, score threshold, expiry, provider or nullifier.
+///
+/// Providers sign the 32-byte SHA-256 digest of this struct's XDR encoding
+/// (an `ScVal` map); `proof_digest` returns that digest so it can be obtained
+/// by simulation rather than re-implemented off-chain.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ZkProofStatement {
+    pub version: u32,
+    pub network_id: BytesN<32>,
+    pub verifier: Address,
+    pub borrower: Address,
+    pub provider_id: String,
+    pub nullifier: BytesN<32>,
+    pub min_score_threshold: u32,
+    pub target_tier: u32,
+    pub expiration: u64,
 }
 
 #[contracttype]
@@ -71,6 +105,10 @@ impl ZkCreditVerifierContract {
     }
 
     /// Admin registers a trusted ZK proof provider (e.g., zkTLS attestation service or Polygon ID issuer).
+    ///
+    /// `public_key_hash` is the SHA-256 of the provider's 32-byte Ed25519
+    /// public key. Re-registering a provider rotates its key: proofs signed
+    /// with the previous key stop verifying.
     pub fn register_provider(env: Env, admin: Address, provider_id: String, public_key_hash: BytesN<32>) {
         admin.require_auth();
         Self::assert_admin(&env, &admin);
@@ -96,10 +134,18 @@ impl ZkCreditVerifierContract {
         env.storage().persistent().has(&key)
     }
 
+    /// SHA-256 of the `ZkProofStatement` a provider must sign for `borrower`
+    /// to submit `proof` to this contract. `proof_bytes` and
+    /// `provider_public_key` are not part of the statement and are ignored.
+    pub fn proof_digest(env: Env, borrower: Address, proof: ZkProofPayload) -> BytesN<32> {
+        Self::statement_digest(&env, &borrower, &proof)
+    }
+
     /// Verify a Zero-Knowledge Credit Proof submitted by a borrower.
     ///
     /// Validates proof expiration, nullifier replay attack protection, provider authorization,
-    /// proof cryptographic integrity, and records the ZK verification on-chain.
+    /// the provider's Ed25519 signature over the proof statement, and records the ZK
+    /// verification on-chain.
     pub fn verify_credit_proof(
         env: Env,
         borrower: Address,
@@ -121,7 +167,7 @@ impl ZkCreditVerifierContract {
 
         // 3. Verify ZK Provider authorization
         let provider_key = DataKey::ProviderKey(proof.provider_id.clone());
-        let _pubkey_hash: BytesN<32> = match env.storage().instance().get(&provider_key) {
+        let pubkey_hash: BytesN<32> = match env.storage().instance().get(&provider_key) {
             Some(hash) => hash,
             None => panic!("Unregistered ZK proof provider"),
         };
@@ -131,18 +177,23 @@ impl ZkCreditVerifierContract {
             panic!("Invalid ZK target tier");
         }
 
-        // 5. Cryptographic proof validation: verify non-zero proof payload commitment
-        let mut non_zero_bytes = false;
-        let proof_array = proof.proof_bytes.to_array();
-        for b in proof_array.iter() {
-            if *b != 0 {
-                non_zero_bytes = true;
-                break;
-            }
+        // 5. Cryptographic proof validation (Issue #336)
+        // 5a. The presented key must be the one registered for this provider.
+        let presented_key_hash: BytesN<32> = env
+            .crypto()
+            .sha256(&Bytes::from(proof.provider_public_key.clone()))
+            .to_bytes();
+        if presented_key_hash != pubkey_hash {
+            panic!("Provider public key does not match registered key hash");
         }
-        if !non_zero_bytes {
-            panic!("Invalid ZK proof payload signature");
-        }
+        // 5b. That key must have signed this exact statement. The host traps
+        // on an invalid signature, so nothing below runs for a forged proof.
+        let digest = Self::statement_digest(&env, &borrower, &proof);
+        env.crypto().ed25519_verify(
+            &proof.provider_public_key,
+            &Bytes::from(digest),
+            &proof.proof_bytes,
+        );
 
         // 6. Mark nullifier as spent in persistent storage
         env.storage().persistent().set(&nullifier_key, &true);
@@ -206,6 +257,21 @@ impl ZkCreditVerifierContract {
             .instance()
             .get(&DataKey::Admin)
             .expect("Contract not initialised")
+    }
+
+    fn statement_digest(env: &Env, borrower: &Address, proof: &ZkProofPayload) -> BytesN<32> {
+        let statement = ZkProofStatement {
+            version: PROOF_STATEMENT_VERSION,
+            network_id: env.ledger().network_id(),
+            verifier: env.current_contract_address(),
+            borrower: borrower.clone(),
+            provider_id: proof.provider_id.clone(),
+            nullifier: proof.nullifier.clone(),
+            min_score_threshold: proof.min_score_threshold,
+            target_tier: proof.target_tier,
+            expiration: proof.expiration,
+        };
+        env.crypto().sha256(&statement.to_xdr(env)).to_bytes()
     }
 
     fn assert_admin(env: &Env, caller: &Address) {

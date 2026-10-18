@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- `zk_credit_verifier::verify_credit_proof` now verifies `proof_bytes` as an
+  Ed25519 signature by the provider's registered key; previously any 64-byte
+  payload with one non-zero byte was accepted, letting anyone grant
+  themselves a higher credit tier. The payload carries the provider's public
+  key (new `provider_public_key` field), whose SHA-256 must match the
+  `public_key_hash` registered for `provider_id`. The signature covers a
+  `ZkProofStatement` binding the network, verifier contract, borrower,
+  provider, nullifier, score threshold, tier and expiry, so proofs cannot be
+  forged, tampered with, transferred to another borrower or replayed on
+  another deployment. Providers sign the digest returned by the new
+  `proof_digest` view; re-registering a provider rotates its key.
+  **Breaking:** `ZkProofPayload` gains `provider_public_key` (#336).
 - `auto_compound_vault::harvest` no longer trusts a caller-supplied
   `yield_amount`, which let anyone with a dust deposit pay themselves the
   vault's entire balance as a "harvest fee" and inflate `TotalManagedAssets`
