@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   received, so `TotalManagedAssets` is always backed by tokens the vault
   holds. **Breaking:** `harvest(caller, yield_amount)` is now
   `harvest(caller)` (#334).
+- `lending::create_loan_request` no longer trusts the caller-supplied
+  `max_loan_amount` and `reputation_tier`, which let a borrower exceed their
+  credit limit and claim Platinum loyalty rewards on repayment. The limit and
+  tier now come from the BorrowerReputationContract (`calculate_max_loan`,
+  including any oracle boost, and the new `get_reputation_tier`), linked with
+  the new admin-only `set_reputation_contract`. The two request fields are
+  kept for wire compatibility but ignored. Loan requests fail closed when no
+  reputation contract is linked or the borrower has no on-chain profile; the
+  deploy scripts link it automatically. The snapshotted tier is readable via
+  `get_loan_reputation_tier` (#335).
 - Funding, pool-deposit and repayment APIs verify the submitted Stellar
   transaction against Horizon (success, signer, loan-bound memo, amount and
   destination) before crediting anything; previously any hash was accepted.

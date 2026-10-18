@@ -106,7 +106,7 @@ flowchart LR
 **Core loan flow**
 
 1. **Onboard** — the user signs a SEP-10 challenge with their wallet, completes KYC, and a reputation profile is initialised.
-2. **Request** — the borrower submits a loan request; the backend reads `calculate_max_loan` / `calculate_interest_rate` from the reputation contract.
+2. **Request** — the borrower submits a loan request; the backend reads `calculate_max_loan` / `calculate_interest_rate` from the reputation contract, and the lending contract re-reads the borrower's credit limit and tier from it on-chain.
 3. **Fund** — a lender funds the request; funds are locked via the escrow contract.
 4. **Activate** — the lender's payment is verified on Horizon, the lender approves the loan on-chain and the server activates it.
 5. **Repay** — the repayment is verified on Horizon and recorded on the contract; on-time payments add reputation events, late ones flow into default management.

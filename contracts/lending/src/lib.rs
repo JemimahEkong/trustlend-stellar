@@ -76,6 +76,17 @@ impl ReferralClient {
     }
 }
 
+/// The subset of the BorrowerReputationContract the lending contract reads
+/// (Issue #335). Unlike the loyalty/referral clients these calls are NOT
+/// wrapped in `try_invoke_contract`: credit limits and tiers are security
+/// critical, so if the reputation contract cannot vouch for the borrower
+/// (no profile, misconfigured, panicking) the loan request must fail closed.
+#[contractclient(name = "ReputationClient")]
+pub trait ReputationInterface {
+    fn calculate_max_loan(env: Env, borrower: Address) -> i128;
+    fn get_reputation_tier(env: Env, borrower: Address) -> u32;
+}
+
 #[contractclient(name = "FlashLoanReceiverClient")]
 pub trait FlashLoanReceiver {
     fn execute_operation(
@@ -142,12 +153,17 @@ pub struct LoanRequestInput {
     pub amount: i128,
     pub duration_days: u32,
     pub interest_rate_bps: u32,
+    /// DEPRECATED — ignored (Issue #335). The credit limit is read on-chain
+    /// from the registered BorrowerReputationContract (`calculate_max_loan`).
+    /// Kept only so existing clients encoding this struct stay compatible.
     pub max_loan_amount: i128,
     /// Collateral entries supporting this loan (multi-asset).
     pub collateral_entries: Vec<CollateralEntry>,
     /// Interest rate model: Fixed or Floating
     pub rate_model: InterestRateModel,
-    /// Borrower reputation tier (0=None, 1=Beginner, 2=Silver, 3=Gold, 4=Platinum)
+    /// DEPRECATED — ignored (Issue #335). The tier is read on-chain from the
+    /// registered BorrowerReputationContract (`get_reputation_tier`).
+    /// Kept only so existing clients encoding this struct stay compatible.
     pub reputation_tier: u32,
 }
 
@@ -248,6 +264,9 @@ pub enum DataKey {
     ReferralContract,
     /// Grace period start timestamp for undercollateralized loans (Issue #157)
     GracePeriodStart(u32),
+    /// BorrowerReputationContract address — source of truth for tiers and
+    /// credit limits (Issue #335)
+    ReputationContract,
 }
 
 /// Default platform fee = 1 % of interest (100 bps) until governance changes it.
@@ -522,6 +541,25 @@ impl LendingContract {
 
     pub fn get_referral_contract(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::ReferralContract)
+    }
+
+    /// Set the BorrowerReputationContract address (admin only, Issue #335).
+    /// Loan requests read each borrower's tier and credit limit from it, so
+    /// `create_loan_request` is rejected until this is configured.
+    pub fn set_reputation_contract(env: Env, admin: Address, reputation: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReputationContract, &reputation);
+        env.events().publish(
+            (symbol_short!("lending"), symbol_short!("rep")),
+            reputation,
+        );
+    }
+
+    pub fn get_reputation_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::ReputationContract)
     }
 
     /// Whitelist a new collateral asset ("adding pools"). Multisig-gated —
@@ -1087,12 +1125,15 @@ impl LendingContract {
     // ── Loan lifecycle ────────────────────────────────────────────────────────
 
     /// Borrower creates a loan request.
-    /// `interest_rate_bps` and `max_loan` are fetched off-chain from the
-    /// ReputationContract and passed in so we avoid a cross-contract call
-    /// on the critical path (cheaper, simpler on testnet).
     ///
-    /// The function checks that the borrower has sufficient borrowing power
-    /// (from multi-asset collateral) to cover the requested loan amount.
+    /// The borrower's credit limit and reputation tier are read on-chain from
+    /// the registered BorrowerReputationContract (Issue #335). The
+    /// `max_loan_amount` and `reputation_tier` fields of `request` are
+    /// deprecated and ignored — trusting them let a borrower bypass their
+    /// limit and claim unearned loyalty rewards.
+    ///
+    /// The function also checks that the borrower has sufficient borrowing
+    /// power (from multi-asset collateral) to cover the requested loan amount.
     pub fn create_loan_request(env: Env, borrower: Address, request: LoanRequestInput) -> u32 {
         borrower.require_auth();
         Self::assert_not_paused(&env);
@@ -1101,10 +1142,10 @@ impl LendingContract {
             amount,
             duration_days,
             interest_rate_bps,
-            max_loan_amount,
+            max_loan_amount: _,
             collateral_entries,
             rate_model,
-            reputation_tier,
+            reputation_tier: _,
         } = request;
 
         if amount <= 0 {
@@ -1113,6 +1154,16 @@ impl LendingContract {
         if amount < MIN_BORROW_AMOUNT {
             panic!("Loan amount below minimum borrow threshold");
         }
+
+        let reputation: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReputationContract)
+            .expect("Reputation contract not configured");
+        let reputation_client = ReputationClient::new(&env, &reputation);
+        let max_loan_amount = reputation_client.calculate_max_loan(&borrower);
+        let reputation_tier = reputation_client.get_reputation_tier(&borrower);
+
         if amount > max_loan_amount {
             panic!("Amount exceeds reputation-based limit");
         }
@@ -1554,6 +1605,15 @@ impl LendingContract {
             .persistent()
             .get(&DataKey::Loan(loan_id))
             .expect("Loan not found")
+    }
+
+    /// Reputation tier snapshotted from the BorrowerReputationContract when
+    /// the loan was created (0=None … 4=Platinum). Used for loyalty rewards.
+    pub fn get_loan_reputation_tier(env: Env, loan_id: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LoanReputationTier(loan_id))
+            .unwrap_or(0)
     }
 
     pub fn get_loan_count(env: Env) -> u32 {

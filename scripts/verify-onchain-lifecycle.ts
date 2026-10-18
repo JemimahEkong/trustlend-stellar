@@ -77,10 +77,15 @@ async function main() {
   }
   ok(`borrower ${borrower.publicKey()}\n    lender   ${lender.publicKey()}`);
 
-  async function invoke(signer: Keypair, method: string, args: Parameters<Contract["call"]>[1][]) {
+  async function invoke(
+    signer: Keypair,
+    method: string,
+    args: Parameters<Contract["call"]>[1][],
+    contractId: string = lendingId,
+  ) {
     const account = await soroban.getAccount(signer.publicKey());
     const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: PASSPHRASE })
-      .addOperation(new Contract(lendingId).call(method, ...args))
+      .addOperation(new Contract(contractId).call(method, ...args))
       .setTimeout(60)
       .build();
     const sim = await soroban.simulateTransaction(tx);
@@ -112,6 +117,15 @@ async function main() {
     const res = await horizon.submitTransaction(tx);
     return res.hash;
   }
+
+  // ── 0. reputation profile ─────────────────────────────────────────────────
+  // The lending contract reads the borrower's credit limit and tier from the
+  // reputation contract (Issue #335), so the borrower needs a profile first.
+  step("Borrower signs init_borrower on the reputation contract");
+  const reputationId =
+    process.env.NEXT_PUBLIC_REPUTATION_CONTRACT_ID || fail("NEXT_PUBLIC_REPUTATION_CONTRACT_ID is not set");
+  await invoke(borrower, "init_borrower", [addr(borrower.publicKey())], reputationId);
+  ok("reputation profile created (tier None, 1 000 XLM limit)");
 
   // ── 1. create_loan_request ────────────────────────────────────────────────
   step("Borrower signs create_loan_request (100 XLM, 30 days, 200 XLM native collateral)");

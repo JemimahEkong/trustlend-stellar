@@ -130,6 +130,34 @@ fn test_limits_scale_with_reputation_event_history() {
     assert_eq!(client.calculate_interest_rate(&borrower), 800);
 }
 
+#[test]
+fn test_get_reputation_tier_tracks_profile_tier() {
+    let (env, contract_id, admin, borrower) = setup();
+    let client = BorrowerReputationContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_reputation_tier(&borrower), 0);
+
+    // 50 → Beginner, 150 → Silver, 500 → Gold, 1000 → Platinum
+    for (events, expected) in [(1u32, 1u32), (2, 2), (7, 3), (10, 4)] {
+        for _ in 0..events {
+            client.add_reputation_event(&admin, &borrower, &ReputationEvent::TestLoanRepaid);
+        }
+        assert_eq!(client.get_reputation_tier(&borrower), expected);
+    }
+
+    client.freeze_account(&admin, &borrower, &String::from_str(&env, "fraud"));
+    assert_eq!(client.get_reputation_tier(&borrower), 0);
+}
+
+#[test]
+fn test_get_reputation_tier_without_profile_fails() {
+    let (env, contract_id, _admin, _borrower) = setup();
+    let client = BorrowerReputationContractClient::new(&env, &contract_id);
+
+    let unknown = Address::generate(&env);
+    assert!(client.try_get_reputation_tier(&unknown).is_err());
+}
+
 // ─── Oracle integration tests ─────────────────────────────────────────────────
 
 /// Setup that also registers an authorized oracle.

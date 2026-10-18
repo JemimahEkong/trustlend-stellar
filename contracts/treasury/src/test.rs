@@ -157,6 +157,14 @@ fn test_collect_protocol_fees_from_lending() {
     let collateral_asset = Address::generate(&env);
     lending.whitelist_asset(&admin, &collateral_asset);
 
+    // Lending reads the borrower's credit limit from the reputation contract.
+    let reputation_id = env.register(borrower_reputation::BorrowerReputationContract, ());
+    let reputation =
+        borrower_reputation::BorrowerReputationContractClient::new(&env, &reputation_id);
+    reputation.initialize(&admin);
+    reputation.init_borrower(&borrower);
+    lending.set_reputation_contract(&admin, &reputation_id);
+
     // Create loan request (accrues platform fee)
     let _loan_id = lending.create_loan_request(
         &borrower,
