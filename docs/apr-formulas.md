@@ -370,7 +370,7 @@ $$F_{\text{platform}} = \frac{I \times F_{\text{protocol}}}{10,\!000}$$
 | $F_{\text{protocol}}$ | `100` bps ($1\%$) | `1000` bps ($10\%$) | Platform fee rate |
 | $I$ | varies | — | Total interest on the loan |
 
-The fee is collected at loan creation and stored as `UncollectedFees`. It can be swept to the Treasury contract by calling `collect_fees()`.
+The fee is collected at loan creation and stored as `UncollectedFees`, denominated in the lending contract's configured fee token (`set_fee_token`, native XLM by default). The Treasury admin collects it with `TreasuryContract.collect_protocol_fees()`, which pulls the fee tokens from the lending contract and credits the treasury's tracked token balance with the amount actually received. `collect_fees()` can only be called by the configured treasury or the lending admin, always pays the configured treasury (`set_treasury`), and fails if the lending contract does not hold the fee tokens backing the accrual.
 
 The platform fee rate can only be changed by a successful DAO governance vote — there is no admin override path.
 

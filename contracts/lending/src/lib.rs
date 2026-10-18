@@ -87,6 +87,13 @@ pub trait ReputationInterface {
     fn get_reputation_tier(env: Env, borrower: Address) -> u32;
 }
 
+/// TreasuryContract entry point used to keep the treasury's per-token
+/// balance in sync when the admin collects fees directly (Issue #338).
+#[contractclient(name = "TreasuryFeeClient")]
+pub trait TreasuryFeeReceiver {
+    fn record_protocol_fees(env: Env, lending_contract: Address, asset_token: Address, amount: i128);
+}
+
 #[contractclient(name = "FlashLoanReceiverClient")]
 pub trait FlashLoanReceiver {
     fn execute_operation(
@@ -267,6 +274,10 @@ pub enum DataKey {
     /// BorrowerReputationContract address — source of truth for tiers and
     /// credit limits (Issue #335)
     ReputationContract,
+    /// TreasuryContract that receives collected platform fees (Issue #338)
+    Treasury,
+    /// SEP-41 token platform fees are denominated in (Issue #338)
+    FeeToken,
 }
 
 /// Default platform fee = 1 % of interest (100 bps) until governance changes it.
@@ -613,6 +624,12 @@ impl LendingContract {
         if amount > balance {
             panic!("Insufficient balance to sweep");
         }
+        // Uncollected platform fees belong to the treasury (Issue #338).
+        if Self::get_fee_token(env.clone()) == Some(token.clone())
+            && amount > balance - Self::get_uncollected_fees(env.clone())
+        {
+            panic!("Cannot sweep uncollected protocol fees");
+        }
 
         token_client.transfer(&contract_address, &recipient, &amount);
 
@@ -687,18 +704,90 @@ impl LendingContract {
             .unwrap_or(0)
     }
 
+    /// Link the TreasuryContract that receives platform fees (admin only,
+    /// Issue #338). It is the only destination `collect_fees` pays.
+    pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.events()
+            .publish((symbol_short!("lending"), symbol_short!("treasury")), treasury);
+    }
+
+    pub fn get_treasury(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Treasury)
+    }
+
+    /// Set the SEP-41 token platform fees are denominated in, e.g. the
+    /// native XLM asset contract (admin only, Issue #338).
+    pub fn set_fee_token(env: Env, admin: Address, fee_token: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::FeeToken, &fee_token);
+        env.events()
+            .publish((symbol_short!("lending"), symbol_short!("fee_tkn")), fee_token);
+    }
+
+    pub fn get_fee_token(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::FeeToken)
+    }
+
+    /// Transfer all uncollected platform fees to the configured treasury.
+    ///
+    /// Callable only by the configured treasury contract or an admin
+    /// (Issue #338), and `treasury_address` must be the configured treasury —
+    /// fees can never be redirected elsewhere. The fee-token transfer and
+    /// the reset of `UncollectedFees` happen together, so accounting can no
+    /// longer be cleared without the tokens moving. When an admin collects
+    /// directly, the treasury is notified so its token balance stays in sync;
+    /// when the treasury itself collects, it does that bookkeeping itself.
     pub fn collect_fees(env: Env, caller: Address, treasury_address: Address) -> i128 {
         caller.require_auth();
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .expect("Treasury not configured");
+        let caller_is_treasury = caller == treasury;
+        if !caller_is_treasury {
+            Self::assert_admin(&env, &caller);
+        }
+        if treasury_address != treasury {
+            panic!("Fees can only be collected to the configured treasury");
+        }
+
         let uncollected: i128 = Self::get_uncollected_fees(env.clone());
         if uncollected <= 0 {
             return 0;
         }
+
+        let fee_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeToken)
+            .expect("Fee token not configured");
+        let token_client = token::Client::new(&env, &fee_token);
+        let contract_address = env.current_contract_address();
+        if token_client.balance(&contract_address) < uncollected {
+            panic!("Insufficient fee token balance to collect fees");
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::UncollectedFees, &0i128);
+        token_client.transfer(&contract_address, &treasury, &uncollected);
+
+        if !caller_is_treasury {
+            TreasuryFeeClient::new(&env, &treasury).record_protocol_fees(
+                &contract_address,
+                &fee_token,
+                &uncollected,
+            );
+        }
+
         env.events().publish(
             (symbol_short!("fees"), symbol_short!("collected")),
-            (treasury_address, uncollected),
+            (treasury, fee_token, uncollected),
         );
         uncollected
     }

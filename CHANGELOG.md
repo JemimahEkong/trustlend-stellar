@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- Protocol fee collection now moves real tokens and is access controlled.
+  `lending::collect_fees` previously zeroed `UncollectedFees` for any caller
+  without transferring anything. It is now callable only by the configured
+  treasury (new `set_treasury`) or the admin, always pays the configured
+  treasury, and transfers the fees in the new `set_fee_token` token —
+  failing if the contract does not hold them. `sweep_tokens` can no longer
+  take uncollected fees. `treasury::collect_protocol_fees` is admin-only,
+  accepts only the lending contract registered with the new
+  `set_lending_contract`, and credits `TokenBalance` with the tokens it
+  actually received, rejecting mismatched reports; when the admin collects
+  on the lending contract directly, it notifies the treasury through the
+  new `record_protocol_fees` so balances stay in sync. The testnet deploy
+  script links both contracts with XLM as the fee token (#338).
 - `auto_compound_vault::harvest` no longer trusts a caller-supplied
   `yield_amount`, which let anyone with a dust deposit pay themselves the
   vault's entire balance as a "harvest fee" and inflate `TotalManagedAssets`
