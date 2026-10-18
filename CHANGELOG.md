@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- `usdc_lending_pool` no longer pays unbacked yield out of other depositors'
+  principal. Yield now comes only from USDC paid in through the new
+  permissionless `fund_yield` (borrower interest, treasury top-ups, etc.) and
+  is streamed to depositors from that reserve at no more than
+  `annual_yield_bps`. A global yield index shares any reserve shortfall
+  pro-rata instead of first-come-first-served, funding is never applied
+  retroactively, and the pool's balance always equals principal owed plus
+  unclaimed yield plus reserve. `get_pool_state` exposes `total_principal`,
+  `yield_reserve`, `yield_unclaimed` and funding/payout totals.
+  **Breaking:** `PoolState`/`DepositRecord` storage layouts changed, so
+  existing deployments must be redeployed; USDC sent to the pool directly is
+  no longer treated as yield (#337).
 - `auto_compound_vault::harvest` no longer trusts a caller-supplied
   `yield_amount`, which let anyone with a dust deposit pay themselves the
   vault's entire balance as a "harvest fee" and inflate `TotalManagedAssets`
