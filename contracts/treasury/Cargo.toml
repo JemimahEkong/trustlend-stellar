@@ -16,5 +16,6 @@ soroban-sdk = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 lending = { path = "../lending", features = ["testutils"] }
+borrower-reputation = { path = "../borrower_reputation" }
 default-management = { path = "../default_management", features = ["testutils"] }
 governance = { path = "../governance", features = ["testutils"] }

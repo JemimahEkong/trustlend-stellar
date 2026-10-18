@@ -156,6 +156,17 @@ stellar contract invoke \
   -- initialize \
   --admin "$ADMIN_ADDRESS"
 
+# Lending reads every borrower's tier and credit limit from the reputation
+# contract (Issue #335); loan requests are rejected until this link exists.
+echo "▶ Linking LendingContract → BorrowerReputationContract…"
+stellar contract invoke \
+  --id "$LENDING_ID" \
+  --source "$ADMIN_KEY" \
+  --network "$NETWORK" \
+  -- set_reputation_contract \
+  --admin "$ADMIN_ADDRESS" \
+  --reputation "$REPUTATION_ID"
+
 echo "▶ Initialising DefaultManagementContract (insurance_balance = 0)…"
 stellar contract invoke \
   --id "$DEFAULT_ID" \

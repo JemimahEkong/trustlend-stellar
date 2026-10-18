@@ -30,7 +30,45 @@ fn setup() -> (Env, Address, Address, Address, Address) {
     let collateral_asset = Address::generate(&env);
     client.whitelist_asset(&admin, &collateral_asset);
 
+    link_reputation(&env, &client, &admin, &borrower);
+
     (env, contract_id, admin, borrower, collateral_asset)
+}
+
+/// Deploy a real BorrowerReputationContract, link it to the lending contract
+/// and give `borrower` a Platinum profile (100 000 XLM limit), so the rest of
+/// the suite can focus on loan-lifecycle behaviour (Issue #335).
+fn link_reputation(env: &Env, client: &LendingContractClient, admin: &Address, borrower: &Address) {
+    let reputation_id = env.register(borrower_reputation::BorrowerReputationContract, ());
+    borrower_reputation::BorrowerReputationContractClient::new(env, &reputation_id)
+        .initialize(admin);
+    client.set_reputation_contract(admin, &reputation_id);
+    give_reputation_profile(env, client, admin, borrower, 4);
+}
+
+/// Create an on-chain reputation profile for `borrower` at `tier`
+/// (0=None … 4=Platinum) in the reputation contract linked to `client`.
+fn give_reputation_profile(
+    env: &Env,
+    client: &LendingContractClient,
+    admin: &Address,
+    borrower: &Address,
+    tier: u32,
+) {
+    let reputation_id = client
+        .get_reputation_contract()
+        .expect("reputation contract not linked");
+    let reputation =
+        borrower_reputation::BorrowerReputationContractClient::new(env, &reputation_id);
+    reputation.init_borrower(borrower);
+    if tier > 0 {
+        reputation.apply_zk_tier_upgrade(
+            admin,
+            borrower,
+            &tier,
+            &BytesN::from_array(env, &[tier as u8; 32]),
+        );
+    }
 }
 
 // Maximum i128 value — useful for overflow boundary checks.
@@ -231,13 +269,37 @@ fn test_no_overflow_at_maximum_valid_inputs() {
 
 /// Passing a principal of i128::MAX should panic with an overflow message,
 /// not silently wrap around to a wrong value.
+///
+/// Such a principal can no longer reach the interest maths through
+/// `create_loan_request` (the on-chain credit limit rejects it first, see
+/// Issue #335), so the helper is exercised directly.
 #[test]
-#[should_panic(expected = "HostError")]
+#[should_panic(expected = "Overflow: principal × rate_bps")]
 fn test_overflow_panics_with_near_max_principal() {
+    // i128::MAX principal × any rate_bps > 1 will overflow the first checked_mul.
+    LendingContract::calculate_interest(I128_MAX, 1500, 365);
+}
+
+/// A principal that overflows only at the second multiplication step
+/// (principal × rate_bps fits, but × days does not) must still panic cleanly.
+#[test]
+#[should_panic(expected = "Overflow: (principal × rate_bps) × days")]
+fn test_overflow_panics_at_second_multiplication() {
+    // i128::MAX / 1500 ≈ 1.13 × 10^35 — this value times 1500 fits in i128,
+    // but multiplying again by 365 will overflow.
+    let boundary_principal: i128 = I128_MAX / 1500;
+    LendingContract::calculate_interest(boundary_principal, 1500, 365);
+}
+
+/// A principal above the borrower's on-chain credit limit is rejected
+/// before any interest arithmetic happens, even when the client claims an
+/// unlimited `max_loan_amount`.
+#[test]
+#[should_panic(expected = "Amount exceeds reputation-based limit")]
+fn test_near_max_principal_rejected_by_on_chain_limit() {
     let (env, contract_id, _admin, borrower, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
 
-    // i128::MAX principal × any rate_bps > 1 will overflow the first checked_mul.
     client.create_loan_request(
         &borrower,
         &LoanRequestInput {
@@ -253,38 +315,7 @@ fn test_overflow_panics_with_near_max_principal() {
                 },
             ],
             rate_model: InterestRateModel::Fixed,
-            reputation_tier: 0,
-        },
-    );
-}
-
-/// A principal that overflows only at the second multiplication step
-/// (principal × rate_bps fits, but × days does not) must still panic cleanly.
-#[test]
-#[should_panic(expected = "HostError")]
-fn test_overflow_panics_at_second_multiplication() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
-    let client = LendingContractClient::new(&env, &contract_id);
-
-    // i128::MAX / 1500 ≈ 2.27 × 10^35 — this value times 1500 fits in i128,
-    // but multiplying again by 365 will overflow.
-    let boundary_principal: i128 = I128_MAX / 1500;
-    client.create_loan_request(
-        &borrower,
-        &LoanRequestInput {
-            amount: boundary_principal,
-            duration_days: 365,
-            interest_rate_bps: 1500,
-            max_loan_amount: I128_MAX,
-            collateral_entries: vec![
-                &env,
-                CollateralEntry {
-                    asset: collateral_asset.clone(),
-                    amount: 100_000_0000000,
-                },
-            ],
-            rate_model: InterestRateModel::Fixed,
-            reputation_tier: 0,
+            reputation_tier: 4,
         },
     );
 }
@@ -434,8 +465,12 @@ fn test_min_borrow_amount_boundary_accepted() {
 #[test]
 #[should_panic(expected = "Amount exceeds reputation-based limit")]
 fn test_amount_over_max_is_rejected() {
-    let (env, contract_id, _admin, borrower, collateral_asset) = setup();
+    let (env, contract_id, admin, _platinum, collateral_asset) = setup();
     let client = LendingContractClient::new(&env, &contract_id);
+
+    // A tier-None borrower's on-chain limit is 1 000 XLM.
+    let borrower = Address::generate(&env);
+    give_reputation_profile(&env, &client, &admin, &borrower, 0);
 
     let max_loan: i128 = 1_000_0000000; // 1 000 XLM
     client.create_loan_request(
@@ -667,6 +702,8 @@ fn setup_with_multisig() -> (Env, Address, Address, Address, Address, Address, A
 
     let collateral_asset = Address::generate(&env);
     client.whitelist_asset(&admin, &collateral_asset);
+
+    link_reputation(&env, &client, &admin, &borrower);
 
     (
         env,
@@ -1634,6 +1671,8 @@ fn setup_multi_collateral() -> (Env, Address, Address, Address, Address, Address
     client.whitelist_asset(&admin, &asset_a);
     client.whitelist_asset(&admin, &asset_b);
 
+    link_reputation(&env, &client, &admin, &borrower);
+
     (env, contract_id, admin, borrower, asset_a, asset_b)
 }
 
@@ -2263,7 +2302,8 @@ fn test_repayment_calls_loyalty_contract() {
     // Link loyalty contract to lending contract
     client.set_loyalty_contract(&admin, &loyalty_id);
 
-    // Create a Platinum-tier loan (reputation_tier = 4)
+    // The borrower is Platinum on-chain, so the loan is snapshotted as tier 4
+    link_reputation(&env, &client, &admin, &borrower);
     let loan_amount: i128 = 10_000_0000000;
     let loan_id = client.create_loan_request(
         &borrower,
@@ -2280,9 +2320,10 @@ fn test_repayment_calls_loyalty_contract() {
                 },
             ],
             rate_model: InterestRateModel::Fixed,
-            reputation_tier: 4, // Platinum
+            reputation_tier: 4,
         },
     );
+    assert_eq!(client.get_loan_reputation_tier(&loan_id), 4);
 
     client.approve_loan(&lender, &loan_id, &1);
     client.activate_loan(&admin, &loan_id);
@@ -2355,6 +2396,7 @@ fn test_late_repayment_no_reward() {
     token_admin_client.mint(&loyalty_id, &1_000_000_0000000);
 
     client.set_loyalty_contract(&admin, &loyalty_id);
+    link_reputation(&env, &client, &admin, &borrower);
 
     let loan_id = client.create_loan_request(
         &borrower,
@@ -2441,6 +2483,7 @@ fn setup_with_referral() -> (Env, Address, Address, Address, Address, Address, A
         .mint(&referral_id, &1_000_0000000);
 
     client.set_referral_contract(&admin, &referral_id);
+    link_reputation(&env, &client, &admin, &borrower);
 
     (
         env,
@@ -2647,6 +2690,7 @@ fn test_activation_succeeds_when_referral_pool_is_empty() {
     // Deliberately no mint — the pool is empty.
     client.set_referral_contract(&admin, &referral_id);
     referral_client.register_referral(&borrower, &referrer);
+    link_reputation(&env, &client, &admin, &borrower);
 
     let loan_id = client.create_loan_request(
         &borrower,
@@ -2801,4 +2845,296 @@ fn test_sweep_amount_exceeding_balance_rejected() {
     let recipient = Address::generate(&env);
     // Attempting to sweep 200 tokens must fail
     client.sweep_tokens(&admin, &unsupported_token, &recipient, &200);
+}
+
+// ─── On-chain reputation enforcement (Issue #335) ─────────────────────────
+
+/// A loan request whose client-side `max_loan_amount` and `reputation_tier`
+/// are attacker-chosen.
+fn spoofed_request(
+    env: &Env,
+    amount: i128,
+    collateral_asset: &Address,
+    claimed_max_loan: i128,
+    claimed_tier: u32,
+) -> LoanRequestInput {
+    LoanRequestInput {
+        amount,
+        duration_days: 30,
+        interest_rate_bps: 1000,
+        max_loan_amount: claimed_max_loan,
+        collateral_entries: vec![
+            env,
+            CollateralEntry {
+                asset: collateral_asset.clone(),
+                amount: 100_000_0000000,
+            },
+        ],
+        rate_model: InterestRateModel::Fixed,
+        reputation_tier: claimed_tier,
+    }
+}
+
+#[test]
+fn test_set_reputation_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(LendingContract, ());
+    let client = LendingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    assert_eq!(client.get_reputation_contract(), None);
+    let reputation = Address::generate(&env);
+    client.set_reputation_contract(&admin, &reputation);
+    assert_eq!(client.get_reputation_contract(), Some(reputation));
+}
+
+#[test]
+fn test_set_reputation_contract_non_admin_rejected() {
+    let (env, contract_id, _admin, _borrower, _collateral_asset) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let original = client.get_reputation_contract();
+    let stranger = Address::generate(&env);
+    let result = client.try_set_reputation_contract(&stranger, &Address::generate(&env));
+    assert!(result.is_err());
+    assert_eq!(client.get_reputation_contract(), original);
+}
+
+/// Without a reputation contract there is nothing to vouch for the borrower,
+/// so the request must fail closed instead of trusting the client.
+#[test]
+#[should_panic(expected = "Reputation contract not configured")]
+fn test_create_loan_rejected_without_reputation_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(LendingContract, ());
+    let client = LendingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    let collateral_asset = Address::generate(&env);
+    client.initialize(&admin);
+    client.set_multisig_admin(&admin, &admin);
+    client.whitelist_asset(&admin, &collateral_asset);
+
+    client.create_loan_request(
+        &borrower,
+        &spoofed_request(&env, 1_000_0000000, &collateral_asset, 100_000_0000000, 4),
+    );
+}
+
+/// A borrower with no on-chain reputation profile cannot borrow at all.
+#[test]
+fn test_create_loan_rejected_without_reputation_profile() {
+    let (env, contract_id, _admin, _borrower, collateral_asset) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let unknown = Address::generate(&env);
+    let result = client.try_create_loan_request(
+        &unknown,
+        &spoofed_request(&env, 100_0000000, &collateral_asset, 100_000_0000000, 4),
+    );
+    assert!(result.is_err());
+    assert_eq!(client.get_loan_count(), 0);
+}
+
+/// A tier-None borrower (1 000 XLM limit) cannot borrow more by claiming a
+/// higher `max_loan_amount` and Platinum tier in the request.
+#[test]
+#[should_panic(expected = "Amount exceeds reputation-based limit")]
+fn test_spoofed_max_loan_amount_cannot_bypass_credit_limit() {
+    let (env, contract_id, admin, _platinum, collateral_asset) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let borrower = Address::generate(&env);
+    give_reputation_profile(&env, &client, &admin, &borrower, 0);
+
+    client.create_loan_request(
+        &borrower,
+        &spoofed_request(&env, 5_000_0000000, &collateral_asset, 100_000_0000000, 4),
+    );
+}
+
+/// The limit is enforced at the exact on-chain boundary for each tier,
+/// whatever the client claims.
+#[test]
+fn test_credit_limit_boundary_comes_from_reputation_contract() {
+    let (env, contract_id, admin, _platinum, collateral_asset) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    // Silver: 5 000 XLM on-chain limit.
+    let borrower = Address::generate(&env);
+    give_reputation_profile(&env, &client, &admin, &borrower, 2);
+    let limit: i128 = 5_000_0000000;
+
+    let over = client.try_create_loan_request(
+        &borrower,
+        &spoofed_request(&env, limit + 1, &collateral_asset, I128_MAX, 4),
+    );
+    assert!(over.is_err());
+
+    let loan_id = client.create_loan_request(
+        &borrower,
+        &spoofed_request(&env, limit, &collateral_asset, I128_MAX, 4),
+    );
+    assert_eq!(client.get_loan(&loan_id).amount, limit);
+}
+
+/// Understating the limit or tier client-side does not hurt an honest
+/// borrower either — the client values are ignored in both directions.
+#[test]
+fn test_understated_client_values_are_ignored() {
+    let (env, contract_id, admin, _platinum, collateral_asset) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    // Gold: 10 000 XLM on-chain limit.
+    let borrower = Address::generate(&env);
+    give_reputation_profile(&env, &client, &admin, &borrower, 3);
+
+    let loan_id = client.create_loan_request(
+        &borrower,
+        &spoofed_request(&env, 10_000_0000000, &collateral_asset, 0, 0),
+    );
+    assert_eq!(client.get_loan(&loan_id).amount, 10_000_0000000);
+    assert_eq!(client.get_loan_reputation_tier(&loan_id), 3);
+}
+
+/// The tier stored for the loan is the borrower's on-chain tier, not the one
+/// claimed in the request.
+#[test]
+fn test_spoofed_reputation_tier_is_ignored() {
+    let (env, contract_id, admin, _platinum, collateral_asset) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let borrower = Address::generate(&env);
+    give_reputation_profile(&env, &client, &admin, &borrower, 0);
+
+    let loan_id = client.create_loan_request(
+        &borrower,
+        &spoofed_request(&env, 500_0000000, &collateral_asset, 500_0000000, 4),
+    );
+    assert_eq!(client.get_loan_reputation_tier(&loan_id), 0);
+}
+
+/// Tier snapshots follow the reputation contract: once the borrower is
+/// genuinely upgraded on-chain, new loans pick up the new tier.
+#[test]
+fn test_loan_tier_tracks_on_chain_reputation() {
+    let (env, contract_id, admin, _platinum, collateral_asset) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+    let reputation = borrower_reputation::BorrowerReputationContractClient::new(
+        &env,
+        &client.get_reputation_contract().unwrap(),
+    );
+
+    let borrower = Address::generate(&env);
+    give_reputation_profile(&env, &client, &admin, &borrower, 1);
+    let first = client.create_loan_request(
+        &borrower,
+        &spoofed_request(&env, 500_0000000, &collateral_asset, 0, 4),
+    );
+    assert_eq!(client.get_loan_reputation_tier(&first), 1);
+
+    reputation.apply_zk_tier_upgrade(&admin, &borrower, &3, &BytesN::from_array(&env, &[9; 32]));
+    let second = client.create_loan_request(
+        &borrower,
+        &spoofed_request(&env, 500_0000000, &collateral_asset, 0, 0),
+    );
+    assert_eq!(client.get_loan_reputation_tier(&second), 3);
+    // The earlier loan keeps the tier it was created with.
+    assert_eq!(client.get_loan_reputation_tier(&first), 1);
+}
+
+/// The oracle-boosted limit from the reputation contract is honoured, so
+/// the on-chain limit is more than a static tier table.
+#[test]
+fn test_oracle_boosted_credit_limit_is_honoured() {
+    let (env, contract_id, admin, _platinum, collateral_asset) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+    let reputation = borrower_reputation::BorrowerReputationContractClient::new(
+        &env,
+        &client.get_reputation_contract().unwrap(),
+    );
+
+    let borrower = Address::generate(&env);
+    give_reputation_profile(&env, &client, &admin, &borrower, 0);
+
+    // Above the 1 000 XLM tier-None limit before any oracle data.
+    let amount: i128 = 1_500_0000000;
+    let before = client.try_create_loan_request(
+        &borrower,
+        &spoofed_request(&env, amount, &collateral_asset, 0, 0),
+    );
+    assert!(before.is_err());
+
+    // A perfect oracle score doubles the limit to 2 000 XLM.
+    let oracle = Address::generate(&env);
+    reputation.set_multisig_admin(&admin, &admin);
+    reputation.set_oracle(&admin, &oracle);
+    reputation.submit_credit_score(
+        &oracle,
+        &borrower,
+        &1000,
+        &3,
+        &soroban_sdk::String::from_str(&env, "test"),
+    );
+    assert_eq!(reputation.calculate_max_loan(&borrower), 2_000_0000000);
+
+    let loan_id = client.create_loan_request(
+        &borrower,
+        &spoofed_request(&env, amount, &collateral_asset, 0, 0),
+    );
+    assert_eq!(client.get_loan(&loan_id).amount, amount);
+}
+
+/// End-to-end: a tier-None borrower claiming Platinum must be paid the
+/// tier-None loyalty reward on on-time repayment, not the Platinum bonus.
+#[test]
+fn test_spoofed_tier_cannot_inflate_loyalty_reward() {
+    let (env, contract_id, admin, _platinum, collateral_asset) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+    let lender = Address::generate(&env);
+
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let loyalty_id = env.register(borrower_loyalty::BorrowerLoyaltyContract, ());
+    let loyalty_client = borrower_loyalty::BorrowerLoyaltyContractClient::new(&env, &loyalty_id);
+    loyalty_client.initialize(
+        &admin,
+        &token_id,
+        &contract_id,
+        &borrower_loyalty::RewardConfig {
+            base_amount: 1_000_0000,
+            reference_loan_amount: 1_000_0000000,
+            max_duration_multiplier_bps: 10_000,
+            tier_none_multiplier_bps: 5_000,
+            tier_beginner_multiplier_bps: 10_000,
+            tier_silver_multiplier_bps: 15_000,
+            tier_gold_multiplier_bps: 20_000,
+            tier_platinum_multiplier_bps: 30_000,
+        },
+    );
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_id)
+        .mint(&loyalty_id, &1_000_000_0000000);
+    client.set_loyalty_contract(&admin, &loyalty_id);
+
+    let borrower = Address::generate(&env);
+    give_reputation_profile(&env, &client, &admin, &borrower, 0);
+
+    let amount: i128 = 1_000_0000000;
+    let loan_id = client.create_loan_request(
+        &borrower,
+        &spoofed_request(&env, amount, &collateral_asset, 100_000_0000000, 4),
+    );
+    client.approve_loan(&lender, &loan_id, &1);
+    client.activate_loan(&admin, &loan_id);
+    let loan = client.get_loan(&loan_id);
+    client.record_payment(&admin, &loan_id, &loan.total_due);
+
+    let none_reward = loyalty_client.calculate_reward_view(&amount, &30, &0);
+    let platinum_reward = loyalty_client.calculate_reward_view(&amount, &30, &4);
+    assert!(none_reward < platinum_reward);
+    assert_eq!(loyalty_client.get_borrower_rewards(&borrower), none_reward);
 }

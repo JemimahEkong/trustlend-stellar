@@ -488,6 +488,20 @@ function initializeContracts(
   if (has("lending")) {
     invoke(ids.lending, "initialize", ["--admin", adminAddress], options);
     log.ok("LendingContract initialized");
+
+    // Loan requests read each borrower's tier and credit limit from the
+    // reputation contract (Issue #335) and are rejected until it is linked.
+    if (has("reputation")) {
+      invoke(
+        ids.lending,
+        "set_reputation_contract",
+        ["--admin", adminAddress, "--reputation", ids.reputation],
+        options
+      );
+      log.ok("LendingContract linked to BorrowerReputationContract");
+    } else {
+      log.warn("No reputation contract id — loan requests will be rejected until set_reputation_contract is called");
+    }
   }
 
   if (has("default_management")) {

@@ -409,11 +409,19 @@ export interface CreateLoanRequestParams {
   durationDays: number;
   /** From `ReputationContract.calculate_interest_rate`. */
   interestRateBps: number;
-  /** From `ReputationContract.calculate_max_loan`. */
+  /**
+   * @deprecated Ignored on-chain (Issue #335): the contract reads the limit
+   * from `ReputationContract.calculate_max_loan` itself. Still encoded so the
+   * `LoanRequestInput` wire format is unchanged.
+   */
   maxLoanAmountStroops: bigint;
   /** At least one whitelisted asset; the contract checks borrowing power. */
   collateralEntries: { asset: string; amount: bigint }[];
   rateModel?: InterestRateModel;
+  /**
+   * @deprecated Ignored on-chain (Issue #335): the contract reads the tier
+   * from `ReputationContract.get_reputation_tier` itself.
+   */
   reputationTier?: ReputationTier;
 }
 

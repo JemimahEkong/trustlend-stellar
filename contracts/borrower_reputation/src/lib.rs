@@ -403,6 +403,16 @@ impl BorrowerReputationContract {
         Self::tier_interest_rate(&profile.reputation_tier)
     }
 
+    /// Reputation tier as a numeric index
+    /// (0=None, 1=Beginner, 2=Silver, 3=Gold, 4=Platinum).
+    ///
+    /// Used by the LendingContract to snapshot a borrower's verified tier at
+    /// loan creation, so it never has to trust a client-supplied value.
+    pub fn get_reputation_tier(env: Env, borrower: Address) -> u32 {
+        let profile = Self::get_profile(env, borrower);
+        Self::tier_index(&profile.reputation_tier)
+    }
+
     /// One-time bootstrap linking the MultiSigAdmin contract (admin only).
     /// Once set, `set_oracle` can ONLY be called by this address — a
     /// compromised single admin key can no longer redirect who is trusted to
@@ -766,6 +776,16 @@ impl BorrowerReputationContract {
             ReputationTier::Silver   => 5_000_0000000,    // 5,000 XLM
             ReputationTier::Gold     => 10_000_0000000,   // 10,000 XLM
             ReputationTier::Platinum => 100_000_0000000,  // 100,000 XLM
+        }
+    }
+
+    fn tier_index(tier: &ReputationTier) -> u32 {
+        match tier {
+            ReputationTier::None     => 0,
+            ReputationTier::Beginner => 1,
+            ReputationTier::Silver   => 2,
+            ReputationTier::Gold     => 3,
+            ReputationTier::Platinum => 4,
         }
     }
 
