@@ -726,7 +726,8 @@ function initializeSatellites(
         ["--admin", adminAddress, "--usdc_token", usdc, "--annual_yield_bps", "800"],
         options
       );
-      log.ok("UsdcLendingPoolContract initialized (8% APY)");
+      log.ok("UsdcLendingPoolContract initialized (up to 8% APY)");
+      log.info("Depositors earn yield only once USDC is paid in via fund_yield");
     } else {
       log.info("Skipping USDC pool initialization — set USDC_TOKEN_ADDRESS to enable it");
     }
