@@ -33,7 +33,12 @@ const toBig = (v: unknown): bigint => (typeof v === "bigint" ? v : BigInt(String
 
 export interface UsdcPoolState {
   totalDeposits: bigint;
+  /** Maximum APY; yield only accrues while the funded reserve covers it. */
   annualYieldBps: number;
+  /** Principal currently owed to depositors. */
+  totalPrincipal: bigint;
+  /** Funded yield not yet released to depositors (see `fundYield`). */
+  yieldReserve: bigint;
   paused: boolean;
   [key: string]: unknown;
 }
@@ -45,6 +50,8 @@ export async function getPoolState(caller: string): Promise<UsdcPoolState> {
     ...r,
     totalDeposits: toBig(r.total_deposits ?? r.total_deposited),
     annualYieldBps: Number(r.annual_yield_bps ?? 0),
+    totalPrincipal: toBig(r.total_principal),
+    yieldReserve: toBig(r.yield_reserve),
     paused: Boolean(paused),
   };
 }
@@ -62,5 +69,14 @@ export async function deposit(depositorAddress: string, amountStroops: bigint) {
 
 export async function withdraw(depositorAddress: string) {
   const { hash } = await write("withdraw", [addressToScVal(depositorAddress)], depositorAddress);
+  return { txHash: hash };
+}
+
+/**
+ * Pay USDC into the pool's yield reserve — the only source of depositor
+ * yield (e.g. borrower interest or a treasury top-up).
+ */
+export async function fundYield(funderAddress: string, amountStroops: bigint) {
+  const { hash } = await write("fund_yield", [addressToScVal(funderAddress), i128ToScVal(amountStroops)], funderAddress);
   return { txHash: hash };
 }
