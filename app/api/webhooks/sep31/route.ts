@@ -27,6 +27,29 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Invalid webhook payload" }, { status: 400 });
     }
 
+    // Always authenticate anchor callbacks, including on testnet, before
+    // looking up or changing any transaction state.
+    const sigHeader = request.headers.get("x-stellar-signature");
+    if (!sigHeader) {
+      return NextResponse.json({ error: "Signature header missing" }, { status: 401 });
+    }
+
+    const homeDomain = process.env.NEXT_PUBLIC_SEP24_ANCHOR_HOME_DOMAIN ?? "testanchor.stellar.org";
+    try {
+      let signingKey = process.env.SEP31_ANCHOR_SIGNING_KEY;
+      if (!signingKey) {
+        const endpoints = await discoverSep31Anchor(homeDomain);
+        signingKey = endpoints.signingKey;
+      }
+
+      if (!await verifyAnchorSignature(rawBody, sigHeader, signingKey)) {
+        return NextResponse.json({ error: "Invalid webhook signature" }, { status: 401 });
+      }
+    } catch (err) {
+      console.error("Webhook signature verification failed:", err);
+      return NextResponse.json({ error: "Signature verification processing failed" }, { status: 401 });
+    }
+
     const db = getDb();
     if (!db) {
       return NextResponse.json({ error: "Database unavailable" }, { status: 503 });
@@ -47,36 +70,6 @@ export async function POST(request: NextRequest) {
 
     if (!ledgerTx) {
       return NextResponse.json({ error: "Transaction not found" }, { status: 404 });
-    }
-
-    // Webhook signature verification
-    const sigHeader =
-      request.headers.get("x-stellar-signature") ||
-      request.headers.get("signature") ||
-      request.headers.get("X-Stellar-Signature");
-
-    const homeDomain = process.env.NEXT_PUBLIC_SEP24_ANCHOR_HOME_DOMAIN ?? "testanchor.stellar.org";
-    const isTestnet = (process.env.NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE ?? "").includes("Test");
-
-    if (sigHeader) {
-      try {
-        let signingKey = process.env.SEP31_ANCHOR_SIGNING_KEY;
-        if (!signingKey) {
-          const endpoints = await discoverSep31Anchor(homeDomain);
-          signingKey = endpoints.signingKey;
-        }
-
-        const isValid = await verifyAnchorSignature(rawBody, sigHeader, signingKey);
-        if (!isValid) {
-          return NextResponse.json({ error: "Invalid webhook signature" }, { status: 401 });
-        }
-      } catch (err) {
-        console.error("Webhook signature verification failed:", err);
-        return NextResponse.json({ error: "Signature verification processing failed" }, { status: 400 });
-      }
-    } else if (!isTestnet) {
-      // In production/mainnet, require a valid signature
-      return NextResponse.json({ error: "Signature header missing" }, { status: 401 });
     }
 
     // If transaction is already processed, return 200 OK

@@ -794,6 +794,7 @@ export function LenderForms({
           amount: parseFloat(params.amount),
           currency: params.currency,
           anchorTxId: txRes.id,
+          anchorJwt: jwt,
           instructions: rawInstructions,
           lenderAddress: wallet.address,
         }),

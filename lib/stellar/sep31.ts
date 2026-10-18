@@ -63,6 +63,8 @@ export type Sep31TxStatus =
 export interface Sep31Transaction {
   id: string;
   status: Sep31TxStatus;
+  asset_code?: string;
+  amount_in_asset?: string;
   amount_in?: string;
   amount_out?: string;
   amount_fee?: string;

@@ -5,13 +5,15 @@ import { and, eq, sql } from "drizzle-orm";
 import { getDb } from "@/lib/db/client";
 import { ledgerTransactions, lendingPools } from "@/lib/db/schema";
 import { requireKycVerified } from "@/lib/kyc/middleware";
+import { getSep24Config } from "@/lib/stellar/sep24-config";
+import { discoverSep31Anchor, getSep31Transaction } from "@/lib/stellar/sep31";
 
 /**
  * POST /api/pools/sep31-deposit
  *
- * Body: { poolId, amount, currency, anchorTxId, instructions, lenderAddress }
+ * Body: { poolId, amount, currency, anchorTxId, anchorJwt, instructions, lenderAddress }
  *
- * Records an initiated SEP-31 deposit as a 'pending' transaction in the ledger.
+ * Verifies the initiated transaction with the anchor before recording it.
  */
 export async function POST(request: NextRequest) {
   try {
@@ -36,17 +38,60 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { poolId, amount, currency, anchorTxId, instructions, lenderAddress } = body as {
+    const { poolId, amount, currency, anchorTxId, instructions, lenderAddress, anchorJwt } = body as {
       poolId: string;
       amount: number;
       currency: string;
       anchorTxId: string;
       instructions: Record<string, unknown>;
       lenderAddress?: string;
+      anchorJwt: string;
     };
 
-    if (!poolId || !amount || amount <= 0 || !currency || !anchorTxId || !instructions) {
+    if (
+      typeof poolId !== "string" || !poolId ||
+      typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0 ||
+      typeof currency !== "string" || !currency ||
+      typeof anchorTxId !== "string" || !anchorTxId ||
+      !instructions || typeof instructions !== "object" ||
+      typeof anchorJwt !== "string" || !anchorJwt
+    ) {
       return NextResponse.json({ error: "Invalid request parameters" }, { status: 400 });
+    }
+
+    let anchorTransaction;
+    try {
+      const { homeDomain } = getSep24Config();
+      const endpoints = await discoverSep31Anchor(homeDomain);
+      anchorTransaction = await getSep31Transaction(
+        endpoints.directPaymentServer,
+        anchorJwt,
+        anchorTxId,
+      );
+    } catch (error) {
+      console.error("Failed to verify SEP-31 transaction with anchor:", error);
+      return NextResponse.json({ error: "Unable to verify transaction with anchor" }, { status: 502 });
+    }
+
+    const pendingStatuses = new Set([
+      "pending_sender",
+      "pending_stellar",
+      "pending_customer_info_update",
+      "pending_transaction_info_update",
+      "hold",
+    ]);
+    const verifiedAmount = Number(anchorTransaction.amount_in);
+    const anchorCurrency = anchorTransaction.asset_code ?? anchorTransaction.amount_in_asset
+      ?.split(":").slice(0, 2).pop();
+    if (
+      anchorTransaction.id !== anchorTxId ||
+      !pendingStatuses.has(anchorTransaction.status) ||
+      !anchorCurrency ||
+      anchorCurrency.toUpperCase() !== currency.toUpperCase() ||
+      !Number.isFinite(verifiedAmount) ||
+      verifiedAmount !== amount
+    ) {
+      return NextResponse.json({ error: "Anchor transaction details do not match the deposit" }, { status: 400 });
     }
 
     // Verify pool exists and is active
