@@ -690,6 +690,20 @@ function initializeSatellites(
       options
     );
     log.ok("TreasuryContract initialized (50/50 insurance / DAO split)");
+
+    if (has("lending")) {
+      // Platform fees are paid in XLM and can only be collected into this
+      // treasury, which only accepts them from this lending contract.
+      invoke(ids.lending, "set_treasury", ["--admin", adminAddress, "--treasury", ids.treasury], options);
+      invoke(ids.lending, "set_fee_token", ["--admin", adminAddress, "--fee_token", xlm], options);
+      invoke(
+        ids.treasury,
+        "set_lending_contract",
+        ["--caller", adminAddress, "--lending_contract", ids.lending],
+        options
+      );
+      log.ok("Lending ↔ Treasury linked for protocol fee collection (XLM)");
+    }
   }
 
   if (has("auto_compound_vault") && has("lending")) {

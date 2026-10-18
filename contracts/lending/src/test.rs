@@ -3138,3 +3138,217 @@ fn test_spoofed_tier_cannot_inflate_loyalty_reward() {
     assert!(none_reward < platinum_reward);
     assert_eq!(loyalty_client.get_borrower_rewards(&borrower), none_reward);
 }
+
+// ─── Protocol fee collection (Issue #338) ─────────────────────────────────
+
+mod mock_treasury {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl};
+
+    /// Records the fees the lending contract reports on admin collection.
+    #[contract]
+    pub struct MockTreasury;
+
+    #[contractimpl]
+    impl TreasuryFeeReceiver for MockTreasury {
+        fn record_protocol_fees(
+            env: Env,
+            lending_contract: Address,
+            _asset_token: Address,
+            amount: i128,
+        ) {
+            lending_contract.require_auth();
+            let total: i128 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("recorded"))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("recorded"), &(total + amount));
+        }
+    }
+
+    #[contractimpl]
+    impl MockTreasury {
+        pub fn recorded(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("recorded"))
+                .unwrap_or(0)
+        }
+    }
+}
+
+/// Lending contract with a treasury and fee token configured and one loan
+/// request whose platform fee is accrued. When `fund` is set, the contract
+/// also holds the fee tokens backing that accrual.
+/// Returns (env, lending_id, admin, fee_token, treasury_id, uncollected).
+fn setup_fee_collection(fund: bool) -> (Env, Address, Address, Address, Address, i128) {
+    let (env, contract_id, admin, borrower, collateral_asset) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let fee_token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let treasury_id = env.register(mock_treasury::MockTreasury, ());
+    client.set_treasury(&admin, &treasury_id);
+    client.set_fee_token(&admin, &fee_token);
+
+    client.create_loan_request(
+        &borrower,
+        &create_request_struct(
+            &env,
+            1_000_0000000,
+            30,
+            1000,
+            100_000_0000000,
+            &collateral_asset,
+            100_000_0000000,
+            InterestRateModel::Fixed,
+        ),
+    );
+    let uncollected = client.get_uncollected_fees();
+    assert!(uncollected > 0);
+    if fund {
+        mint_tokens(&env, &fee_token, &contract_id, uncollected);
+    }
+
+    (env, contract_id, admin, fee_token, treasury_id, uncollected)
+}
+
+#[test]
+fn test_set_treasury_and_fee_token() {
+    let (env, contract_id, admin, _borrower, _collateral) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_treasury(), None);
+    assert_eq!(client.get_fee_token(), None);
+
+    let treasury = Address::generate(&env);
+    let fee_token = Address::generate(&env);
+    client.set_treasury(&admin, &treasury);
+    client.set_fee_token(&admin, &fee_token);
+    assert_eq!(client.get_treasury(), Some(treasury));
+    assert_eq!(client.get_fee_token(), Some(fee_token));
+}
+
+#[test]
+fn test_set_treasury_and_fee_token_non_admin_rejected() {
+    let (env, contract_id, _admin, _borrower, _collateral) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+    let stranger = Address::generate(&env);
+
+    assert!(client
+        .try_set_treasury(&stranger, &Address::generate(&env))
+        .is_err());
+    assert!(client
+        .try_set_fee_token(&stranger, &Address::generate(&env))
+        .is_err());
+    assert_eq!(client.get_treasury(), None);
+    assert_eq!(client.get_fee_token(), None);
+}
+
+/// Admin collection moves the fee tokens to the treasury, clears the
+/// accrual and notifies the treasury of the amount.
+#[test]
+fn test_admin_collect_fees_transfers_tokens_to_treasury() {
+    let (env, contract_id, admin, fee_token, treasury_id, uncollected) = setup_fee_collection(true);
+    let client = LendingContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &fee_token);
+
+    let collected = client.collect_fees(&admin, &treasury_id);
+
+    assert_eq!(collected, uncollected);
+    assert_eq!(client.get_uncollected_fees(), 0);
+    assert_eq!(token_client.balance(&treasury_id), uncollected);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(
+        mock_treasury::MockTreasuryClient::new(&env, &treasury_id).recorded(),
+        uncollected
+    );
+}
+
+/// When the treasury contract itself collects, the tokens still move but no
+/// notification is sent back (the treasury does its own bookkeeping).
+#[test]
+fn test_treasury_collect_fees_transfers_without_notification() {
+    let (env, contract_id, _admin, fee_token, treasury_id, uncollected) = setup_fee_collection(true);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.collect_fees(&treasury_id, &treasury_id), uncollected);
+    assert_eq!(token::Client::new(&env, &fee_token).balance(&treasury_id), uncollected);
+    assert_eq!(
+        mock_treasury::MockTreasuryClient::new(&env, &treasury_id).recorded(),
+        0
+    );
+}
+
+/// Anyone else cannot trigger collection, and nothing changes.
+#[test]
+fn test_collect_fees_by_unauthorised_caller_rejected() {
+    let (env, contract_id, _admin, fee_token, treasury_id, uncollected) = setup_fee_collection(true);
+    let client = LendingContractClient::new(&env, &contract_id);
+    let stranger = Address::generate(&env);
+
+    assert!(client.try_collect_fees(&stranger, &treasury_id).is_err());
+    assert!(client.try_collect_fees(&stranger, &stranger).is_err());
+    assert_eq!(client.get_uncollected_fees(), uncollected);
+    assert_eq!(token::Client::new(&env, &fee_token).balance(&contract_id), uncollected);
+}
+
+/// Even the admin cannot send fees anywhere but the configured treasury.
+#[test]
+#[should_panic(expected = "Fees can only be collected to the configured treasury")]
+fn test_collect_fees_to_other_destination_rejected() {
+    let (env, contract_id, admin, _fee_token, _treasury_id, _uncollected) = setup_fee_collection(true);
+    let client = LendingContractClient::new(&env, &contract_id);
+    client.collect_fees(&admin, &Address::generate(&env));
+}
+
+#[test]
+#[should_panic(expected = "Treasury not configured")]
+fn test_collect_fees_without_treasury_rejected() {
+    let (env, contract_id, admin, _borrower, _collateral) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+    client.collect_fees(&admin, &Address::generate(&env));
+}
+
+/// Accounting cannot be cleared without the tokens to back it.
+#[test]
+fn test_collect_fees_without_fee_tokens_rejected() {
+    // The accrual is recorded but no fee tokens back it.
+    let (env, contract_id, admin, fee_token, treasury_id, uncollected) = setup_fee_collection(false);
+    let client = LendingContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &fee_token);
+
+    assert!(client.try_collect_fees(&admin, &treasury_id).is_err());
+    assert_eq!(client.get_uncollected_fees(), uncollected);
+    assert_eq!(token_client.balance(&treasury_id), 0);
+}
+
+#[test]
+fn test_collect_fees_with_nothing_accrued_returns_zero() {
+    let (env, contract_id, admin, _borrower, _collateral) = setup();
+    let client = LendingContractClient::new(&env, &contract_id);
+    let treasury_id = env.register(mock_treasury::MockTreasury, ());
+    client.set_treasury(&admin, &treasury_id);
+
+    assert_eq!(client.collect_fees(&admin, &treasury_id), 0);
+}
+
+/// `sweep_tokens` cannot take fee tokens reserved for the treasury.
+#[test]
+fn test_sweep_cannot_take_uncollected_fees() {
+    let (env, contract_id, admin, fee_token, _treasury_id, uncollected) = setup_fee_collection(true);
+    let client = LendingContractClient::new(&env, &contract_id);
+    let recipient = Address::generate(&env);
+
+    mint_tokens(&env, &fee_token, &contract_id, 100);
+    assert!(client
+        .try_sweep_tokens(&admin, &fee_token, &recipient, &101)
+        .is_err());
+
+    client.sweep_tokens(&admin, &fee_token, &recipient, &100);
+    assert_eq!(token::Client::new(&env, &fee_token).balance(&contract_id), uncollected);
+}

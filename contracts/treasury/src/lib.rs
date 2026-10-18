@@ -1,11 +1,18 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
-    Symbol, Vec,
+    contract, contractclient, contractimpl, contracttype, symbol_short, token, Address, BytesN,
+    Env, Vec,
 };
 
 #[cfg(test)]
 mod test;
+
+/// The LendingContract fee interface the treasury pulls from (Issue #338).
+#[contractclient(name = "LendingFeeClient")]
+pub trait LendingFeeSource {
+    fn get_fee_token(env: Env) -> Option<Address>;
+    fn collect_fees(env: Env, caller: Address, treasury_address: Address) -> i128;
+}
 
 // ─── Types & Storage ─────────────────────────────────────────────────────────
 
@@ -39,6 +46,8 @@ pub enum DataKey {
     DistributionCount,
     Distribution(u32),
     TokenBalance(Address),
+    /// LendingContract the treasury collects platform fees from (Issue #338)
+    LendingContract,
 }
 
 pub const DEFAULT_INSURANCE_SHARE_BPS: u32 = 5000; // 50%
@@ -145,31 +154,85 @@ impl TreasuryContract {
             .set(&DataKey::DaoTreasury, &dao_treasury);
     }
 
-    /// Collect accrued platform fees from lending contract into Treasury.
+    /// Register the LendingContract platform fees are collected from
+    /// (admin only, Issue #338).
+    pub fn set_lending_contract(env: Env, caller: Address, lending_contract: Address) {
+        caller.require_auth();
+        Self::assert_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::LendingContract, &lending_contract);
+    }
+
+    pub fn get_lending_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::LendingContract)
+    }
+
+    /// Collect accrued platform fees from the lending contract into the
+    /// Treasury (admin only).
+    ///
+    /// The lending contract transfers the fee tokens here; the treasury
+    /// credits `TokenBalance` with the amount it actually received — measured
+    /// from its own token balance — and refuses a collection whose reported
+    /// amount does not match the tokens that arrived (Issue #338).
     pub fn collect_protocol_fees(env: Env, caller: Address, lending_contract: Address) -> i128 {
         caller.require_auth();
+        Self::assert_admin(&env, &caller);
+        Self::assert_lending_contract(&env, &lending_contract);
 
-        let args = soroban_sdk::vec![
-            &env,
-            caller.into_val(&env),
-            env.current_contract_address().into_val(&env),
-        ];
-        let collected: i128 =
-            env.invoke_contract(&lending_contract, &Symbol::new(&env, "collect_fees"), args);
+        let lending = LendingFeeClient::new(&env, &lending_contract);
+        let fee_token = lending
+            .get_fee_token()
+            .expect("Lending fee token not configured");
+        let token_client = token::Client::new(&env, &fee_token);
+        let this = env.current_contract_address();
 
-        if collected > 0 {
-            let total: i128 = Self::get_total_collected_fees(env.clone());
-            env.storage()
-                .instance()
-                .set(&DataKey::TotalCollectedFees, &(total + collected));
+        let balance_before = token_client.balance(&this);
+        let reported = lending.collect_fees(&this, &this);
+        let received = token_client.balance(&this) - balance_before;
+        if received != reported {
+            panic!("Collected fees do not match tokens received");
+        }
 
+        if received > 0 {
+            Self::credit_fees(&env, &fee_token, received);
             env.events().publish(
                 (symbol_short!("treasury"), symbol_short!("collect")),
-                (lending_contract, collected),
+                (lending_contract, fee_token, received),
             );
         }
 
-        collected
+        received
+    }
+
+    /// Record platform fees the registered lending contract has already
+    /// transferred here, when its admin collects fees directly instead of via
+    /// `collect_protocol_fees` (Issue #338). Only the registered lending
+    /// contract may call this, and only for tokens the treasury actually holds
+    /// beyond its tracked balance.
+    pub fn record_protocol_fees(
+        env: Env,
+        lending_contract: Address,
+        asset_token: Address,
+        amount: i128,
+    ) {
+        lending_contract.require_auth();
+        Self::assert_lending_contract(&env, &lending_contract);
+        if amount <= 0 {
+            panic!("Fee amount must be positive");
+        }
+
+        let tracked = Self::get_treasury_balance(env.clone(), asset_token.clone());
+        let held = token::Client::new(&env, &asset_token).balance(&env.current_contract_address());
+        if held < tracked + amount {
+            panic!("Fee tokens not received");
+        }
+
+        Self::credit_fees(&env, &asset_token, amount);
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("collect")),
+            (lending_contract, asset_token, amount),
+        );
     }
 
     /// Deposit fee tokens directly into the Treasury.
@@ -186,16 +249,7 @@ impl TreasuryContract {
             &amount,
         );
 
-        let current_bal = Self::get_treasury_balance(env.clone(), asset_token.clone());
-        env.storage().persistent().set(
-            &DataKey::TokenBalance(asset_token.clone()),
-            &(current_bal + amount),
-        );
-
-        let total = Self::get_total_collected_fees(env.clone());
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalCollectedFees, &(total + amount));
+        Self::credit_fees(&env, &asset_token, amount);
 
         env.events().publish(
             (symbol_short!("treasury"), symbol_short!("deposit")),
@@ -374,6 +428,31 @@ impl TreasuryContract {
             }
         }
         list
+    }
+
+    /// Add received fee tokens to the tracked balance and lifetime total.
+    fn credit_fees(env: &Env, asset_token: &Address, amount: i128) {
+        let current_bal = Self::get_treasury_balance(env.clone(), asset_token.clone());
+        env.storage().persistent().set(
+            &DataKey::TokenBalance(asset_token.clone()),
+            &(current_bal + amount),
+        );
+
+        let total = Self::get_total_collected_fees(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalCollectedFees, &(total + amount));
+    }
+
+    fn assert_lending_contract(env: &Env, lending_contract: &Address) {
+        let registered: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LendingContract)
+            .expect("Lending contract not configured");
+        if *lending_contract != registered {
+            panic!("Unauthorised: not the registered lending contract");
+        }
     }
 
     fn assert_admin(env: &Env, caller: &Address) {
